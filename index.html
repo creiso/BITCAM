@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no">
+<meta name="theme-color" content="#000000">
+<title>BITCAM</title>
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="icon-192.png">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<main id="app">
+  <header class="top">
+    <button id="btnFlash" class="tool" aria-pressed="false" aria-label="Flash" hidden>
+      <svg viewBox="0 0 24 24"><path d="M13 2 5 13.5h5.5L9.5 22 19 9.5h-6z"/></svg>
+    </button>
+    <button id="btnEv" class="tool" aria-pressed="false" aria-label="Exposição" hidden>
+      <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3M5 5l2 2M17 17l2 2M19 5l-2 2M7 17l-2 2" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+    </button>
+    <div id="status" class="status" aria-live="polite"></div>
+    <button id="btnGrid" class="tool" aria-pressed="false" aria-label="Grade">
+      <svg viewBox="0 0 24 24"><path d="M9 3v18M15 3v18M3 9h18M3 15h18" fill="none" stroke="currentColor" stroke-width="1.6"/></svg>
+    </button>
+    <button id="btnBit" class="tool chip" aria-pressed="true" aria-label="Processamento BIT">BIT</button>
+  </header>
+
+  <section id="stage" class="stage">
+    <div id="frame" class="frame">
+      <video id="video" playsinline autoplay muted></video>
+      <div id="grid" class="grid" hidden></div>
+      <div id="focus" class="focus" hidden></div>
+      <div id="shutterFx" class="shutter-fx"></div>
+      <div id="hint" class="hint" hidden></div>
+    </div>
+    <div id="evBox" class="ev" hidden>
+      <label for="ev">EV <output id="evVal">0</output></label>
+      <input id="ev" type="range">
+    </div>
+  </section>
+
+  <div class="rail">
+    <div id="lenses" class="chips" hidden></div>
+    <div id="zooms" class="chips" hidden></div>
+  </div>
+
+  <nav class="modes" role="tablist">
+    <button role="tab" data-mode="foto" aria-selected="true">Foto</button>
+    <button role="tab" data-mode="noite" aria-selected="false">Noite</button>
+  </nav>
+
+  <footer class="bottom">
+    <button id="thumb" class="thumb" aria-label="Última foto" disabled></button>
+    <button id="shutter" class="shutter" aria-label="Fotografar"><span></span></button>
+    <button id="btnFlip" class="round" aria-label="Trocar câmera">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 9a8 8 0 0 1 14-3l2 2M20 15a8 8 0 0 1-14 3l-2-2"/><path d="M20 4v4h-4M4 20v-4h4"/></svg>
+    </button>
+  </footer>
+</main>
+
+<div id="gate" class="gate">
+  <img src="icon.svg" alt="" width="84" height="84">
+  <h1>BITCAM</h1>
+  <p id="gateMsg">Cada foto é um burst de quadros alinhados e fundidos, com HDR local e acabamento de cor.</p>
+  <button id="btnStart" class="cta">Abrir câmera</button>
+</div>
+
+<div id="viewer" class="viewer" hidden>
+  <header>
+    <button id="vClose" class="tool" aria-label="Fechar">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M6 6l12 12M18 6 6 18"/></svg>
+    </button>
+    <div id="vInfo" class="status"></div>
+  </header>
+  <div class="vstage">
+    <img id="vImg" alt="Foto processada">
+    <canvas id="vOrig" hidden></canvas>
+    <div id="vTag" class="hint" hidden>Original (1 quadro)</div>
+  </div>
+  <footer>
+    <button id="vCompare" class="pill">Segure: original</button>
+    <button id="vShare" class="pill" hidden>Compartilhar</button>
+    <button id="vSave" class="pill solid">Salvar</button>
+  </footer>
+</div>
+
+<script src="app.js"></script>
+</body>
+</html>
