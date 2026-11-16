@@ -2,10 +2,31 @@
 <resources>
     <color name="black">#000000</color>
     <color name="icon_bg">#0B0F0E</color>
+    <color name="panel">#101413</color>
+    <color name="line">#2A312E</color>
+    <color name="fg">#F2F5F3</color>
+    <color name="dim">#8D9792</color>
+    <color name="accent">#7CF5C8</color>
+    <color name="accent_ink">#04261B</color>
     <style name="AppTheme" parent="android:Theme.Material.NoActionBar">
         <item name="android:windowBackground">@color/black</item>
         <item name="android:statusBarColor">@color/black</item>
         <item name="android:navigationBarColor">@color/black</item>
-        <item name="android:windowLayoutInDisplayCutoutMode">shortEdges</item>
+        <item name="android:colorAccent">@color/accent</item>
+    </style>
+    <style name="Chip">
+        <item name="android:layout_width">wrap_content</item>
+        <item name="android:layout_height">36dp</item>
+        <item name="android:minWidth">0dp</item>
+        <item name="android:minHeight">0dp</item>
+        <item name="android:paddingStart">14dp</item>
+        <item name="android:paddingEnd">14dp</item>
+        <item name="android:layout_marginStart">4dp</item>
+        <item name="android:layout_marginEnd">4dp</item>
+        <item name="android:background">@drawable/chip</item>
+        <item name="android:textColor">@color/chip_text</item>
+        <item name="android:textSize">13sp</item>
+        <item name="android:textAllCaps">false</item>
+        <item name="android:stateListAnimator">@null</item>
     </style>
 </resources>

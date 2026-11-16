@@ -1,6 +1,6 @@
 # BITCAM
 
-Câmera com fotografia computacional para Android (APK) e para o navegador (PWA). As duas versões usam o mesmo pipeline.
+Câmera com fotografia computacional. O app Android nativo fica em `android/`; a raiz guarda o protótipo web (PWA) do pipeline de burst.
 
 ## O que ela faz a cada foto
 
@@ -35,21 +35,32 @@ node test/pipeline.test.js    # testes do pipeline
 
 Para usar no celular, publique a pasta em qualquer hospedagem estática com HTTPS. No GitHub: **Settings → Pages → Deploy from a branch**, raiz do branch. Não há etapa de build.
 
-## App Android
+## App Android (moto g54 5G)
 
-`android/` é um projeto Gradle em Java: uma casca nativa (WebView) que empacota os arquivos da raiz como assets e acrescenta:
+`android/` é um app nativo (Kotlin + C++) feito para o moto g54 5G, que expõe Camera2 `LEVEL_3` com RAW. Ele não usa o motor web da raiz.
 
-- permissão de câmera do sistema;
-- fotos gravadas direto na galeria, em `DCIM/BITCAM`;
-- botões de volume como disparador;
-- tela cheia, tela sempre ligada, botão voltar fecha o visualizador.
+### Etapa 1 — RAW e cor (atual)
 
-Requer Android 10 ou superior.
+- Captura um quadro RAW (4080×3060) antes do processamento da Motorola.
+- Revelação própria em C++ (`app/src/main/cpp/bitraw.cpp`): nível de preto, sombreamento da lente, balanço de branco, demosaico Malvar-He-Cutler, matrizes de cor do sensor, curva de tons, redução de ruído de cor e nitidez leve.
+- Balanço de branco: **Auto BIT** (estimado pela cena), **Motorola** (o do aparelho), **Kelvin** (temperatura, tint e predefinições) e **Travar último** (fixa o valor da última foto).
+- Salva JPEG e, opcionalmente, o DNG em `DCIM/BITCAM`.
+- Toque para focar; botões de volume disparam.
+
+Ainda não tem: fusão de burst (Etapa 2), HDR local e modo noite (Etapa 3), zoom.
+
+### Compilar e testar
 
 ```sh
 cd android
 ANDROID_HOME=/caminho/do/sdk ./gradlew assembleRelease
 # APK em app/build/outputs/apk/release/app-release.apk
+
+# teste da revelação no computador, com um sensor simulado
+cd app/src
+g++ -O2 -std=c++17 -fsanitize=address,undefined -Imain/cpp test/cpp/test_bitraw.cpp main/cpp/bitraw.cpp -lpthread -o /tmp/t && /tmp/t
 ```
+
+Precisa do SDK 35, NDK 27.2.12479018 e CMake 3.22.1.
 
 O APK é assinado com `android/bitcam.keystore`, uma chave fixa e pública neste repositório, para que builds novos atualizem o app já instalado. Ela serve para instalação direta; para publicar na Play Store, troque por uma chave privada.

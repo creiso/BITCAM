@@ -1,0 +1,188 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="@color/black"
+    android:fitsSystemWindows="true"
+    android:orientation="vertical">
+
+    <TextView
+        android:id="@+id/status"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:fontFamily="monospace"
+        android:gravity="center"
+        android:maxLines="2"
+        android:paddingStart="12dp"
+        android:paddingTop="10dp"
+        android:paddingEnd="12dp"
+        android:paddingBottom="8dp"
+        android:textColor="@color/dim"
+        android:textSize="12sp" />
+
+    <FrameLayout
+        android:id="@+id/stage"
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_weight="1">
+
+        <FrameLayout
+            android:id="@+id/frame"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:layout_gravity="center">
+
+            <SurfaceView
+                android:id="@+id/preview"
+                android:layout_width="match_parent"
+                android:layout_height="match_parent" />
+
+            <View
+                android:id="@+id/focusRing"
+                android:layout_width="72dp"
+                android:layout_height="72dp"
+                android:background="@drawable/ring"
+                android:visibility="gone" />
+
+            <TextView
+                android:id="@+id/hint"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_gravity="center_horizontal|top"
+                android:layout_marginTop="14dp"
+                android:background="#AA000000"
+                android:fontFamily="monospace"
+                android:paddingStart="12dp"
+                android:paddingTop="6dp"
+                android:paddingEnd="12dp"
+                android:paddingBottom="6dp"
+                android:textColor="@color/fg"
+                android:textSize="12sp"
+                android:visibility="gone" />
+        </FrameLayout>
+    </FrameLayout>
+
+    <LinearLayout
+        android:id="@+id/kelvinPanel"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical"
+        android:paddingStart="16dp"
+        android:paddingTop="6dp"
+        android:paddingEnd="16dp"
+        android:visibility="gone">
+
+        <TextView
+            android:id="@+id/kelvinLabel"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:fontFamily="monospace"
+            android:textColor="@color/fg"
+            android:textSize="12sp" />
+
+        <SeekBar
+            android:id="@+id/kelvinSeek"
+            android:layout_width="match_parent"
+            android:layout_height="32dp"
+            android:max="160" />
+
+        <TextView
+            android:id="@+id/tintLabel"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:fontFamily="monospace"
+            android:textColor="@color/fg"
+            android:textSize="12sp" />
+
+        <SeekBar
+            android:id="@+id/tintSeek"
+            android:layout_width="match_parent"
+            android:layout_height="32dp"
+            android:max="100" />
+
+        <HorizontalScrollView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:scrollbars="none">
+
+            <LinearLayout
+                android:id="@+id/presets"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal" />
+        </HorizontalScrollView>
+    </LinearLayout>
+
+    <HorizontalScrollView
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:fillViewport="true"
+        android:paddingTop="8dp"
+        android:scrollbars="none">
+
+        <LinearLayout
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_gravity="center_horizontal"
+            android:gravity="center"
+            android:orientation="horizontal"
+            android:paddingStart="8dp"
+            android:paddingEnd="8dp">
+
+            <Button android:id="@+id/wbAuto" style="@style/Chip" android:text="Auto BIT" />
+            <Button android:id="@+id/wbSensor" style="@style/Chip" android:text="Motorola" />
+            <Button android:id="@+id/wbKelvin" style="@style/Chip" android:text="Kelvin" />
+            <Button android:id="@+id/wbLock" style="@style/Chip" android:enabled="false" android:text="Travar último" />
+        </LinearLayout>
+    </HorizontalScrollView>
+
+    <RelativeLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:paddingStart="28dp"
+        android:paddingTop="12dp"
+        android:paddingEnd="28dp"
+        android:paddingBottom="18dp">
+
+        <ImageView
+            android:id="@+id/thumb"
+            android:layout_width="52dp"
+            android:layout_height="52dp"
+            android:layout_alignParentStart="true"
+            android:layout_centerVertical="true"
+            android:background="@drawable/thumb_bg"
+            android:clipToOutline="true"
+            android:contentDescription="Última foto"
+            android:scaleType="centerCrop" />
+
+        <Button
+            android:id="@+id/shutter"
+            android:layout_width="76dp"
+            android:layout_height="76dp"
+            android:layout_centerInParent="true"
+            android:background="@drawable/shutter"
+            android:contentDescription="Fotografar"
+            android:stateListAnimator="@null" />
+
+        <LinearLayout
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_alignParentEnd="true"
+            android:layout_centerVertical="true"
+            android:gravity="end"
+            android:orientation="vertical">
+
+            <Button android:id="@+id/flip" style="@style/Chip" android:layout_marginEnd="0dp" android:text="Frontal" />
+
+            <CheckBox
+                android:id="@+id/dng"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="4dp"
+                android:checked="true"
+                android:text="DNG"
+                android:textColor="@color/dim"
+                android:textSize="12sp" />
+        </LinearLayout>
+    </RelativeLayout>
+</LinearLayout>
