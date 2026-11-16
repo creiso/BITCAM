@@ -1,6 +1,6 @@
 # BITCAM
 
-Câmera web (PWA) com fotografia computacional. Roda no navegador do celular, instala na tela inicial e funciona offline.
+Câmera com fotografia computacional para Android (APK) e para o navegador (PWA). As duas versões usam o mesmo pipeline.
 
 ## O que ela faz a cada foto
 
@@ -34,3 +34,22 @@ node test/pipeline.test.js    # testes do pipeline
 ```
 
 Para usar no celular, publique a pasta em qualquer hospedagem estática com HTTPS. No GitHub: **Settings → Pages → Deploy from a branch**, raiz do branch. Não há etapa de build.
+
+## App Android
+
+`android/` é um projeto Gradle em Java: uma casca nativa (WebView) que empacota os arquivos da raiz como assets e acrescenta:
+
+- permissão de câmera do sistema;
+- fotos gravadas direto na galeria, em `DCIM/BITCAM`;
+- botões de volume como disparador;
+- tela cheia, tela sempre ligada, botão voltar fecha o visualizador.
+
+Requer Android 10 ou superior.
+
+```sh
+cd android
+ANDROID_HOME=/caminho/do/sdk ./gradlew assembleRelease
+# APK em app/build/outputs/apk/release/app-release.apk
+```
+
+O APK é assinado com `android/bitcam.keystore`, uma chave fixa e pública neste repositório, para que builds novos atualizem o app já instalado. Ela serve para instalação direta; para publicar na Play Store, troque por uma chave privada.

@@ -1,0 +1,60 @@
+plugins {
+    id 'com.android.application'
+}
+
+// O app web (raiz do repositório) é empacotado como assets do APK.
+def webDir = layout.buildDirectory.dir('generated/webassets')
+def syncWeb = tasks.register('syncWeb', Copy) {
+    from(rootProject.file('..')) {
+        include 'index.html', 'style.css', 'app.js', 'worker.js', 'pipeline.js', 'icon.svg'
+    }
+    into webDir
+}
+
+android {
+    namespace 'app.bitcam'
+    compileSdk 35
+
+    defaultConfig {
+        applicationId 'app.bitcam'
+        minSdk 29
+        targetSdk 35
+        versionCode 1
+        versionName '1.0'
+    }
+
+    signingConfigs {
+        // Chave fixa no repositório para que builds novos atualizem o app instalado.
+        // Serve para instalar por fora da loja; não use para publicar na Play Store.
+        sideload {
+            storeFile rootProject.file('bitcam.keystore')
+            storePassword 'bitcam'
+            keyAlias 'bitcam'
+            keyPassword 'bitcam'
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            signingConfig signingConfigs.sideload
+        }
+        debug {
+            signingConfig signingConfigs.sideload
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    sourceSets.main.assets.srcDir(webDir)
+    lint { checkReleaseBuilds false }
+}
+
+dependencies {
+    implementation 'androidx.webkit:webkit:1.12.1'
+}
+
+tasks.named('preBuild') { dependsOn syncWeb }

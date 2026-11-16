@@ -299,8 +299,8 @@
       S.photos.unshift(photo);
       if (S.photos.length > 24) { var old = S.photos.pop(); URL.revokeObjectURL(old.url); }
       $('thumb').style.backgroundImage = 'url(' + photo.url + ')'; $('thumb').disabled = false;
-      download(photo);
-      hint('Salva · ' + photo.info, 2200);
+      var saved = await download(photo);
+      hint(saved ? (NATIVE ? 'Salva na galeria · ' : 'Salva · ') + photo.info : 'Não foi possível salvar a foto', saved ? 2200 : 4000);
     } catch (e) {
       frames.forEach(function (b) { b.close(); });
       if (S.caps.torch) apply({ torch: false });
@@ -311,9 +311,25 @@
   }
 
   // ---------- salvar / visualizar ----------
-  function download(p) {
+  var NATIVE = window.BitcamNative || null; // ponte do app Android
+
+  // No Android nativo a foto vai direto para a galeria (DCIM/BITCAM).
+  async function saveNative(p) {
+    var u8 = new Uint8Array(await p.blob.arrayBuffer()), STEP = 3 * 128 * 1024;
+    if (!NATIVE.begin(p.name)) return false;
+    for (var o = 0; o < u8.length; o += STEP) {
+      var part = u8.subarray(o, Math.min(u8.length, o + STEP)), bin = '';
+      for (var i = 0; i < part.length; i += 8192) bin += String.fromCharCode.apply(null, part.subarray(i, i + 8192));
+      if (!NATIVE.chunk(btoa(bin))) return false;
+    }
+    return NATIVE.end();
+  }
+
+  async function download(p) {
+    if (NATIVE) return saveNative(p);
     var a = document.createElement('a'); a.href = p.url; a.download = p.name;
     document.body.appendChild(a); a.click(); a.remove();
+    return true;
   }
   function canShare(p) {
     try { return !!(navigator.canShare && navigator.canShare({ files: [new File([p.blob], p.name, { type: 'image/jpeg' })] })); } catch (e) { return false; }
@@ -344,7 +360,7 @@
   document.querySelectorAll('.modes button').forEach(function (b) { b.onclick = function () { S.mode = b.dataset.mode; showInfo(); }; });
   $('thumb').onclick = function () { openViewer(S.photos[0]); };
   $('vClose').onclick = function () { showOrig(false); $('viewer').hidden = true; };
-  $('vSave').onclick = function () { if (S.current) download(S.current); };
+  $('vSave').onclick = function () { if (S.current) download(S.current).then(function (ok) { $('vInfo').textContent = ok ? 'Salva' + (NATIVE ? ' na galeria' : '') : 'Não foi possível salvar'; }); };
   $('vShare').onclick = function () {
     var p = S.current; if (!p) return;
     navigator.share({ files: [new File([p.blob], p.name, { type: 'image/jpeg' })] }).catch(function () {});
@@ -373,6 +389,12 @@
     navigator.permissions.query({ name: 'camera' }).then(function (p) { if (p.state === 'granted') begin(); }, function () {});
   }
 
-  if ('serviceWorker' in navigator && location.protocol === 'https:') navigator.serviceWorker.register('sw.js').catch(function () {});
+  // ganchos usados pelo app Android (volume = disparo, botão voltar, permissão concedida)
+  window.__bitcamShoot = function () { if ($('viewer').hidden && $('gate').hidden) shoot(); };
+  window.__bitcamStart = function () { if (!S.stream) begin(); };
+  window.__bitcamBack = function () { if ($('viewer').hidden) return false; $('vClose').onclick(); return true; };
+  if (NATIVE) begin();
+
+  if (!NATIVE && 'serviceWorker' in navigator && location.protocol === 'https:') navigator.serviceWorker.register('sw.js').catch(function () {});
   window.__bitcam = S; // para depuração
 })();
