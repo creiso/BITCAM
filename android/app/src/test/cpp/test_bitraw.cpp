@@ -249,6 +249,13 @@ int main() {
             if (rot == 90) { ox = p.cropH - 1 - y; oy = x; } else if (rot == 180) { ox = p.cropW - 1 - x; oy = p.cropH - 1 - y; } else { ox = y; oy = p.cropW - 1 - x; }
             CHECK(memcmp(&base[((size_t)y * p.cropW + x) * 4], &out[((size_t)oy * w + ox) * 4], 4) == 0, "rotação %d: pixel no lugar errado", rot);
             CHECK((rot == 180) == (w == p.cropW), "rotação %d: tamanho %dx%d", rot, w, h);
+            // invertida: mesmo pixel, na coluna espelhada
+            p.mirror = 1;
+            std::vector<uint8_t> flipped((size_t)w * h * 4);
+            CHECK(develop(s.raw.data(), p, flipped.data(), w * 4, nullptr), "inverter %d", rot);
+            CHECK(memcmp(&out[((size_t)oy * w + ox) * 4], &flipped[((size_t)oy * w + (w - 1 - ox)) * 4], 4) == 0, "rotação %d invertida: pixel no lugar errado", rot);
+            CHECK(memcmp(&out[((size_t)oy * w + ox) * 4], &flipped[((size_t)oy * w + ox) * 4], 4) != 0, "rotação %d: inverter não mudou nada", rot);
+            p.mirror = 0;
         }
         printf("rotações ok\n");
     }

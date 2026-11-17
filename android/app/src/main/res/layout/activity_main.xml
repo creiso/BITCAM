@@ -219,6 +219,15 @@
                 android:text="DNG"
                 android:textColor="@color/dim"
                 android:textSize="12sp" />
+
+            <CheckBox
+                android:id="@+id/mirror"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:checked="false"
+                android:text="Inverter"
+                android:textColor="@color/dim"
+                android:textSize="12sp" />
         </LinearLayout>
     </RelativeLayout>
 </LinearLayout>

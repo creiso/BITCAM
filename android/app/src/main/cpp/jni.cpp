@@ -12,7 +12,7 @@ using namespace bitraw;
 namespace {
 // Layout de fp[] (ver RawProcessor.kt): 0-3 preto, 4 branco, 5-7 neutro, 8 kelvin, 9 tint,
 // 10 cm1, 19 cm2, 28 cc1, 37 cc2, 46 fm1, 55 fm2, 64 t1, 65 t2, 66 look.
-const int FP_LEN = 67, IP_LEN = 13;
+const int FP_LEN = 67, IP_LEN = 14;
 
 void fillCal(const jfloat* f, ColorCal& c) {
     memcpy(c.cm1, f + 10, 9 * sizeof(float));
@@ -85,6 +85,7 @@ Java_app_bitcam_Native_burstDevelop(JNIEnv* env, jclass, jintArray jip, jfloatAr
     p.width = g_w; p.height = g_h; p.stride = g_stride; p.cfa = ip[3];
     p.cropX = ip[4]; p.cropY = ip[5]; p.cropW = ip[6]; p.cropH = ip[7];
     p.rotation = ip[8]; p.wbMode = ip[9]; p.iso = ip[10];
+    p.mirror = ip[13];
     p.shCols = ip[11]; p.shRows = ip[12];
     for (int i = 0; i < 4; i++) p.black[i] = fp[i];
     p.white = fp[4];

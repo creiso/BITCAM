@@ -84,7 +84,7 @@ object RawProcessor {
     /** Funde e revela os quadros já entregues a [Native.burstAdd] (todos de [w]×[h]). */
     fun develop(
         w: Int, h: Int, c: CameraCharacteristics, r: CaptureResult, cal: FloatArray,
-        rotation: Int, wbMode: Int, kelvin: Float, tint: Float
+        rotation: Int, mirror: Boolean, wbMode: Int, kelvin: Float, tint: Float
     ): Result? {
         val crop = cropFor(c, w, h)
 
@@ -128,7 +128,7 @@ object RawProcessor {
         val ip = intArrayOf(
             w, h, 0, cfa,
             crop.left, crop.top, crop.width(), crop.height(),
-            rotation, wbMode, iso, shCols, shRows
+            rotation, wbMode, iso, shCols, shRows, if (mirror) 1 else 0
         )
         val swap = rotation == 90 || rotation == 270
         val bmp = Bitmap.createBitmap(

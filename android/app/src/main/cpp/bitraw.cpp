@@ -558,6 +558,7 @@ static bool developImpl(const uint16_t* raw, const float* rawF, const RawParams&
     const float amt = 0.6f + 0.3f * (float)look, core = p.iso >= 1600 ? 4.0f : p.iso >= 400 ? 2.5f : 1.5f;
     const float sat = 1.10f + 0.25f * (float)look;
     const int rot = p.rotation;
+    const int outW = (rot == 90 || rot == 270) ? H : W;
     parallelRows(H, [&](int y0, int y1) {
         for (int y = y0; y < y1; y++) {
             const uint8_t* c1 = &Y[(size_t)y * W];
@@ -578,6 +579,7 @@ static bool developImpl(const uint16_t* raw, const float* rawF, const RawParams&
                 else if (rot == 90) { ox = H - 1 - y; oy = x; }
                 else if (rot == 180) { ox = W - 1 - x; oy = H - 1 - y; }
                 else { ox = y; oy = W - 1 - x; }
+                if (p.mirror) ox = outW - 1 - ox;
                 uint8_t* o = out + (size_t)oy * outStride + (size_t)ox * 4;
                 o[0] = (uint8_t)(R < 0 ? 0 : R > 255 ? 255 : (int)(R + 0.5f));
                 o[1] = (uint8_t)(G < 0 ? 0 : G > 255 ? 255 : (int)(G + 0.5f));

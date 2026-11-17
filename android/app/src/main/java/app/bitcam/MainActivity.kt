@@ -90,6 +90,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     private lateinit var wbLock: Button
     private lateinit var flip: Button
     private lateinit var dngBox: CheckBox
+    private lateinit var mirrorBox: CheckBox
     private lateinit var stage: View
     private lateinit var videoPanel: View
     private lateinit var vLock: Button
@@ -161,6 +162,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     @Volatile private var kelvin = 5200f
     @Volatile private var tint = 0f
     @Volatile private var deviceRotation = 0
+    @Volatile private var mirrorPhoto = false   // inverte a foto salva na horizontal; lembrado por câmera
     @Volatile private var saveDng = false   // o DNG é o negativo cru, não a foto final: só para quem edita RAW
     private var lastEstimate: Pair<Float, Float>? = null
     private var lastPhoto: Uri? = null
@@ -189,6 +191,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         wbLock = findViewById(R.id.wbLock)
         flip = findViewById(R.id.flip)
         dngBox = findViewById(R.id.dng)
+        mirrorBox = findViewById(R.id.mirror)
         stage = findViewById(R.id.stage)
         videoPanel = findViewById(R.id.videoPanel)
         vLock = findViewById(R.id.vLock)
@@ -371,7 +374,10 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
                     status("Erro ao abrir a câmera (código $error).")
                 }
             }, cam)
-            ui.post { flip.text = if (facing == CameraCharacteristics.LENS_FACING_FRONT) "Traseira" else "Frontal" }
+            ui.post {
+                flip.text = if (facing == CameraCharacteristics.LENS_FACING_FRONT) "Traseira" else "Frontal"
+                mirrorBox.isChecked = getPreferences(MODE_PRIVATE).getBoolean(mirrorKey(), false)
+            }
             status((if (videoMode) videoLabel else "RAW ${raw.width}×${raw.height}") + " · abrindo…")
         } catch (e: Exception) {
             opening = false
@@ -830,9 +836,12 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     private fun showRotation() {
         val angle = when (deviceRotation) { 90 -> -90f; 270 -> 90f; 180 -> 180f; else -> 0f }
         ui.post {
-            for (v in listOf(thumb, flip, dngBox, modePhoto, modeVideo)) v.animate().rotation(angle).setDuration(150).start()
+            for (v in listOf(thumb, flip, dngBox, mirrorBox, modePhoto, modeVideo)) v.animate().rotation(angle).setDuration(150).start()
         }
     }
+
+    /** A escolha de inverter é guardada separadamente para a câmera frontal e para a traseira. */
+    private fun mirrorKey() = if (facing == CameraCharacteristics.LENS_FACING_FRONT) "mirror_front" else "mirror_back"
 
     private fun showMode() {
         modePhoto.isSelected = !videoMode
@@ -842,6 +851,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         flip.isEnabled = !recording
         videoPanel.visibility = if (videoMode) View.VISIBLE else View.GONE
         dngBox.visibility = if (videoMode) View.INVISIBLE else View.VISIBLE
+        mirrorBox.visibility = if (videoMode) View.INVISIBLE else View.VISIBLE
         wbButtons[RawProcessor.WB_AUTO]?.isEnabled = !videoMode
         vLock.isSelected = lockOnRecord
         vNatural.isSelected = natural
@@ -969,13 +979,14 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         val w = burstW
         val h = burstH
         val got = burstGot
+        val mirror = mirrorPhoto
         ui.post { hint(if (got > 1) "Fundindo $got quadros…" else "Revelando…") }
-        worker.execute { develop(img, w, h, c, res, calibration, rotation, mode, k, t) }
+        worker.execute { develop(img, w, h, c, res, calibration, rotation, mirror, mode, k, t) }
     }
 
     private fun develop(
         dngImage: Image?, w: Int, h: Int, c: CameraCharacteristics, res: TotalCaptureResult, calibration: FloatArray,
-        rotation: Int, mode: Int, k: Float, t: Float
+        rotation: Int, mirror: Boolean, mode: Int, k: Float, t: Float
     ) {
         val t0 = SystemClock.elapsedRealtime()
         val name = "BITCAM_" + SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
@@ -986,7 +997,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
                 dngNote = try { saveDng(name, c, res, dngImage, rotation); " + DNG" } catch (e: Exception) { " (DNG falhou)" }
                 try { dngImage.close() } catch (_: Exception) { }
             }
-            val out = RawProcessor.develop(w, h, c, res, calibration, rotation, mode, k, t)
+            val out = RawProcessor.develop(w, h, c, res, calibration, rotation, mirror, mode, k, t)
             if (out == null) {
                 message = "Não foi possível revelar este RAW" + if (dngNote == " + DNG") " (o DNG foi salvo)." else "."
             } else {
@@ -1177,6 +1188,10 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
             presets.addView(b)
         }
         dngBox.setOnCheckedChangeListener { _, on -> saveDng = on }
+        mirrorBox.setOnCheckedChangeListener { _, on ->
+            mirrorPhoto = on
+            getPreferences(MODE_PRIVATE).edit().putBoolean(mirrorKey(), on).apply()
+        }
         flip.setOnClickListener {
             if (busy || recording) return@setOnClickListener
             facing = if (facing == CameraCharacteristics.LENS_FACING_FRONT) CameraCharacteristics.LENS_FACING_BACK else CameraCharacteristics.LENS_FACING_FRONT

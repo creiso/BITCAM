@@ -58,6 +58,7 @@ Ainda não tem: HDR local e modo noite (Etapa 3), zoom.
 - O resultado segue para a mesma revelação da Etapa 1, que passa a aplicar menos redução de ruído.
 - O JPEG leva no EXIF (ImageDescription) o diagnóstico da revelação: quadros fundidos, ruído medido, balanço de branco, níveis de preto e branco.
 - O DNG vem desligado por padrão: é o negativo cru do primeiro quadro, não a foto final.
+- **Inverter**: salva a foto espelhada na horizontal. A escolha é guardada separadamente para a câmera frontal e a traseira.
 
 ### Vídeo V1 — cor, brilho e compressão (atual)
 

@@ -20,6 +20,7 @@ struct RawParams {
     int cfa;                // 0 RGGB, 1 GRBG, 2 GBRG, 3 BGGR (na origem do buffer)
     int cropX, cropY, cropW, cropH;   // área ativa
     int rotation;           // 0/90/180/270, horário, aplicado na saída
+    int mirror;             // != 0: inverte a saída na horizontal (depois da rotação), como num espelho
     int wbMode;
     int iso;
     float black[4];         // nível de preto por posição do bloco 2x2 (ordem de leitura)
