@@ -204,7 +204,14 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
 
         orientationListener = object : OrientationEventListener(this) {
             override fun onOrientationChanged(o: Int) {
-                if (o != ORIENTATION_UNKNOWN) deviceRotation = ((o + 45) / 90 * 90) % 360
+                if (o == ORIENTATION_UNKNOWN) return   // aparelho deitado na mesa: mantém a última leitura firme
+                // histerese: só troca quando o aparelho passou bem do meio do caminho (60°, não 45°),
+                // para uma leitura instável perto da diagonal não virar a foto
+                var d = Math.abs(o - deviceRotation) % 360
+                if (d > 180) d = 360 - d
+                if (d <= 60) return
+                deviceRotation = ((o + 45) / 90 * 90) % 360
+                showRotation()
             }
         }
     }
@@ -808,6 +815,14 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
             requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), 2)
         }
         cam?.post { closeCamera(); openCamera() }
+    }
+
+    /** Gira os controles junto com o aparelho: mostra como a foto será salva. */
+    private fun showRotation() {
+        val angle = when (deviceRotation) { 90 -> -90f; 270 -> 90f; 180 -> 180f; else -> 0f }
+        ui.post {
+            for (v in listOf(thumb, flip, dngBox, modePhoto, modeVideo)) v.animate().rotation(angle).setDuration(150).start()
+        }
     }
 
     private fun showMode() {
