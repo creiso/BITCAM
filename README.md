@@ -49,6 +49,16 @@ Para usar no celular, publique a pasta em qualquer hospedagem estática com HTTP
 
 Ainda não tem: fusão de burst (Etapa 2), HDR local e modo noite (Etapa 3), zoom.
 
+### Vídeo V1 — cor, brilho e compressão (atual)
+
+- Modo **Vídeo** em 1080p a 30 qps constantes, HEVC a ~36 Mbps (H.264 a ~48 Mbps se o aparelho recusar HEVC), áudio AAC.
+- **Travar cor e brilho**: ao gravar, exposição e balanço de branco ficam fixos. **Reajustar** solta as travas por 1,5 s para se adaptar a um novo ambiente.
+- Balanço de branco **Motorola** ou **Kelvin** (o Auto BIT depende do RAW e não vale para vídeo; "Travar último" traz o valor da última foto).
+- **Natural**: desliga a nitidez artificial do aparelho e usa uma curva de contraste própria.
+- **Estabilizar**: estabilização eletrônica somada à óptica.
+
+O vídeo passa pelo processador de imagem da Motorola; não há fusão de quadros. Pouca luz fica para a etapa V2.
+
 ### Compilar e testar
 
 ```sh

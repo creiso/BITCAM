@@ -23,15 +23,21 @@ import android.hardware.camera2.params.MeteringRectangle
 import android.hardware.camera2.params.OutputConfiguration
 import android.hardware.camera2.params.RggbChannelVector
 import android.hardware.camera2.params.SessionConfiguration
+import android.hardware.camera2.params.TonemapCurve
 import android.media.ExifInterface
 import android.media.Image
 import android.media.ImageReader
+import android.media.MediaCodec
+import android.media.MediaCodecList
+import android.media.MediaFormat
+import android.media.MediaRecorder
 import android.net.Uri
 import android.os.Bundle
 import android.os.Environment
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.Looper
+import android.os.ParcelFileDescriptor
 import android.os.SystemClock
 import android.provider.MediaStore
 import android.util.Size
@@ -39,6 +45,7 @@ import android.view.Gravity
 import android.view.KeyEvent
 import android.view.MotionEvent
 import android.view.OrientationEventListener
+import android.view.Surface
 import android.view.SurfaceHolder
 import android.view.SurfaceView
 import android.view.View
@@ -50,6 +57,7 @@ import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.SeekBar
 import android.widget.TextView
+import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -82,6 +90,14 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     private lateinit var wbLock: Button
     private lateinit var flip: Button
     private lateinit var dngBox: CheckBox
+    private lateinit var stage: View
+    private lateinit var videoPanel: View
+    private lateinit var vLock: Button
+    private lateinit var vReadjust: Button
+    private lateinit var vNatural: Button
+    private lateinit var vStab: Button
+    private lateinit var modePhoto: Button
+    private lateinit var modeVideo: Button
     private lateinit var orientationListener: OrientationEventListener
 
     private val ui = Handler(Looper.getMainLooper())
@@ -109,6 +125,28 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     private var captureToken = 0
     private var lastStatusAt = 0L
     @Volatile private var holdStatusUntil = 0L   // mantém o resultado da foto legível
+
+    // ---- vídeo
+    @Volatile private var videoMode = false
+    @Volatile private var recording = false
+    @Volatile private var lockOnRecord = true    // trava cor e brilho enquanto grava
+    @Volatile private var natural = true         // sem nitidez artificial + curva de contraste própria
+    @Volatile private var stabilize = true
+    @Volatile private var unlockUntil = 0L       // janela do "Reajustar"
+    private var recSurface: Surface? = null
+    private var recorder: MediaRecorder? = null
+    private var recUri: Uri? = null
+    private var recFd: ParcelFileDescriptor? = null
+    private var recStartedAt = 0L
+    private var videoSize = Size(1920, 1080)
+    private var videoHevc = false
+    private var videoBitrate = 20_000_000
+    private var avcCap = 0
+    private var videoLabel = ""
+    private var curve: TonemapCurve? = null
+    private var curveReady = false
+    private var askedAudio = false
+    private var lastMime = "image/jpeg"
 
     // ---- estado compartilhado
     @Volatile private var facing = CameraCharacteristics.LENS_FACING_BACK
@@ -145,6 +183,14 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         wbLock = findViewById(R.id.wbLock)
         flip = findViewById(R.id.flip)
         dngBox = findViewById(R.id.dng)
+        stage = findViewById(R.id.stage)
+        videoPanel = findViewById(R.id.videoPanel)
+        vLock = findViewById(R.id.vLock)
+        vReadjust = findViewById(R.id.vReadjust)
+        vNatural = findViewById(R.id.vNatural)
+        vStab = findViewById(R.id.vStab)
+        modePhoto = findViewById(R.id.modePhoto)
+        modeVideo = findViewById(R.id.modeVideo)
         wbButtons = mapOf(
             RawProcessor.WB_AUTO to findViewById(R.id.wbAuto),
             RawProcessor.WB_SENSOR to findViewById(R.id.wbSensor),
@@ -153,24 +199,26 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
 
         preview.holder.addCallback(this)
         setupControls()
-        showWb()
-
-        // mantém o visor em 3:4 (retrato) dentro do espaço disponível
-        val stage = findViewById<View>(R.id.stage)
-        stage.addOnLayoutChangeListener { v, _, _, _, _, _, _, _, _ ->
-            val w = minOf(v.width, v.height * 3 / 4)
-            val h = w * 4 / 3
-            val lp = frame.layoutParams as FrameLayout.LayoutParams
-            if (w > 0 && (lp.width != w || lp.height != h)) {
-                lp.width = w; lp.height = h; lp.gravity = Gravity.CENTER
-                frame.post { frame.layoutParams = lp }
-            }
-        }
+        showMode()
+        stage.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ -> layoutFrame() }
 
         orientationListener = object : OrientationEventListener(this) {
             override fun onOrientationChanged(o: Int) {
                 if (o != ORIENTATION_UNKNOWN) deviceRotation = ((o + 45) / 90 * 90) % 360
             }
+        }
+    }
+
+    /** Mantém o visor em 3:4 (foto) ou 9:16 (vídeo) dentro do espaço disponível. */
+    private fun layoutFrame() {
+        val aw = if (videoMode) 9 else 3
+        val ah = if (videoMode) 16 else 4
+        val w = minOf(stage.width, stage.height * aw / ah)
+        val h = w * ah / aw
+        val lp = frame.layoutParams as FrameLayout.LayoutParams
+        if (w > 0 && (lp.width != w || lp.height != h)) {
+            lp.width = w; lp.height = h; lp.gravity = Gravity.CENTER
+            frame.post { frame.layoutParams = lp }
         }
     }
 
@@ -206,6 +254,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     }
 
     override fun onRequestPermissionsResult(code: Int, perms: Array<out String>, results: IntArray) {
+        if (code != 1) return   // microfone: sem ele o vídeo só fica mudo
         if (results.isNotEmpty() && results[0] == PackageManager.PERMISSION_GRANTED) {
             cam?.post { openCamera() }
         } else {
@@ -269,9 +318,19 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
             afRegion = null
 
             val sizes = map.getOutputSizes(SurfaceHolder::class.java) ?: emptyArray()
-            previewSize = sizes.filter { it.width * 3 == it.height * 4 && it.width <= 1920 }.maxByOrNull { it.width }
-                ?: sizes.filter { it.width <= 1920 }.maxByOrNull { it.width * it.height }
-                ?: Size(1440, 1080)
+            curve = null
+            curveReady = false
+            if (videoMode) {
+                val rec = map.getOutputSizes(MediaRecorder::class.java) ?: emptyArray()
+                val both = rec.filter { r -> sizes.any { it == r } && r.width * 9 == r.height * 16 && r.width <= 1920 }
+                videoSize = both.maxByOrNull { it.width } ?: Size(1280, 720)
+                chooseEncoder(videoSize)
+                previewSize = videoSize
+            } else {
+                previewSize = sizes.filter { it.width * 3 == it.height * 4 && it.width <= 1920 }.maxByOrNull { it.width }
+                    ?: sizes.filter { it.width <= 1920 }.maxByOrNull { it.width * it.height }
+                    ?: Size(1440, 1080)
+            }
             val ps = previewSize
             ui.post { preview.holder.setFixedSize(ps.width, ps.height) }
 
@@ -299,9 +358,8 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
                     status("Erro ao abrir a câmera (código $error).")
                 }
             }, cam)
-            val rawText = "RAW ${raw.width}×${raw.height}"
             ui.post { flip.text = if (facing == CameraCharacteristics.LENS_FACING_FRONT) "Traseira" else "Frontal" }
-            status("$rawText · abrindo…")
+            status((if (videoMode) videoLabel else "RAW ${raw.width}×${raw.height}") + " · abrindo…")
         } catch (e: Exception) {
             opening = false
             status("Não foi possível abrir a câmera: ${e.message}")
@@ -315,7 +373,10 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     }
 
     private fun closeCamera() {
+        if (recording) stopRecording()
         closeSession()
+        try { recSurface?.release() } catch (_: Exception) { }
+        recSurface = null
         try { device?.close() } catch (_: Exception) { }
         device = null
         try { rawReader?.close() } catch (_: Exception) { }
@@ -336,7 +397,8 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         if (surface == null || !surface.isValid) return
         try {
             configuring = true
-            val outputs = listOf(OutputConfiguration(surface), OutputConfiguration(reader.surface))
+            val second = if (videoMode) ensureRecSurface() else reader.surface
+            val outputs = listOf(OutputConfiguration(surface), OutputConfiguration(second))
             d.createCaptureSession(SessionConfiguration(SessionConfiguration.SESSION_REGULAR, outputs, camExecutor,
                 object : CameraCaptureSession.StateCallback() {
                     override fun onConfigured(s: CameraCaptureSession) {
@@ -348,7 +410,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
 
                     override fun onConfigureFailed(s: CameraCaptureSession) {
                         configuring = false
-                        status("A câmera recusou a configuração RAW + visor.")
+                        status(if (videoMode) "A câmera recusou a configuração de vídeo." else "A câmera recusou a configuração RAW + visor.")
                     }
                 }))
         } catch (e: Exception) {
@@ -371,13 +433,71 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
             }
             if ((chars?.get(CameraCharacteristics.CONTROL_MAX_REGIONS_AF) ?: 0) > 0) b.set(CaptureRequest.CONTROL_AF_REGIONS, arrayOf(region))
             if ((chars?.get(CameraCharacteristics.CONTROL_MAX_REGIONS_AE) ?: 0) > 0) b.set(CaptureRequest.CONTROL_AE_REGIONS, arrayOf(region))
+        } else if (videoMode && supports(CameraCharacteristics.CONTROL_AF_AVAILABLE_MODES, CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_VIDEO)) {
+            b.set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_VIDEO)   // foco mais suave para vídeo
         } else if (supports(CameraCharacteristics.CONTROL_AF_AVAILABLE_MODES, CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_PICTURE)) {
             b.set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
         }
         if (supports(CameraCharacteristics.LENS_INFO_AVAILABLE_OPTICAL_STABILIZATION, CameraMetadata.LENS_OPTICAL_STABILIZATION_MODE_ON)) {
             b.set(CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE, CameraMetadata.LENS_OPTICAL_STABILIZATION_MODE_ON)
         }
+        if (videoMode) {
+            // taxa de quadros constante
+            chars?.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)
+                ?.firstOrNull { it.lower == 30 && it.upper == 30 }
+                ?.let { b.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, it) }
+            if (supports(CameraCharacteristics.CONTROL_AVAILABLE_VIDEO_STABILIZATION_MODES, CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_ON)) {
+                b.set(CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE,
+                    if (stabilize) CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_ON else CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_OFF)
+            }
+            if (natural) {
+                if (supports(CameraCharacteristics.EDGE_AVAILABLE_EDGE_MODES, CameraMetadata.EDGE_MODE_OFF)) {
+                    b.set(CaptureRequest.EDGE_MODE, CameraMetadata.EDGE_MODE_OFF)
+                }
+                naturalCurve()?.let {
+                    b.set(CaptureRequest.TONEMAP_MODE, CameraMetadata.TONEMAP_MODE_CONTRAST_CURVE)
+                    b.set(CaptureRequest.TONEMAP_CURVE, it)
+                }
+            }
+        }
         applyWb(b)
+        // gravando com a trava ligada: exposição e balanço de branco ficam como estavam
+        if (videoMode && recording && lockOnRecord && SystemClock.elapsedRealtime() >= unlockUntil) {
+            if (chars?.get(CameraCharacteristics.CONTROL_AE_LOCK_AVAILABLE) == true) b.set(CaptureRequest.CONTROL_AE_LOCK, true)
+            if (b.get(CaptureRequest.CONTROL_AWB_MODE) == CameraMetadata.CONTROL_AWB_MODE_AUTO &&
+                chars?.get(CameraCharacteristics.CONTROL_AWB_LOCK_AVAILABLE) == true) {
+                b.set(CaptureRequest.CONTROL_AWB_LOCK, true)
+            }
+        }
+    }
+
+    /** Curva de contraste do modo Natural: gama sRGB com um S leve, sem o contraste forçado de fábrica. */
+    private fun naturalCurve(): TonemapCurve? {
+        if (curveReady) return curve
+        curveReady = true
+        val max = chars?.get(CameraCharacteristics.TONEMAP_MAX_CURVE_POINTS) ?: 0
+        if (max < 16 || !supports(CameraCharacteristics.TONEMAP_AVAILABLE_TONE_MAP_MODES, CameraMetadata.TONEMAP_MODE_CONTRAST_CURVE)) return null
+        val n = minOf(64, max)
+        val pts = FloatArray(n * 2)
+        for (i in 0 until n) {
+            val t = i / (n - 1f)
+            val x = t * t   // mais pontos nas sombras
+            var y = if (x <= 0.0031308f) 12.92f * x else 1.055f * Math.pow(x.toDouble(), 1 / 2.4).toFloat() - 0.055f
+            y += 0.10f * y * (1 - y) * (2 * y - 1)
+            pts[i * 2] = x
+            pts[i * 2 + 1] = y.coerceIn(0f, 1f)
+        }
+        curve = TonemapCurve(pts, pts, pts)
+        return curve
+    }
+
+    /** Pedido para o visor; no vídeo usa o modelo de gravação e inclui o gravador enquanto grava. */
+    private fun newBuilder(d: CameraDevice): CaptureRequest.Builder {
+        val b = d.createCaptureRequest(if (videoMode) CameraDevice.TEMPLATE_RECORD else CameraDevice.TEMPLATE_PREVIEW)
+        b.addTarget(preview.holder.surface)
+        if (recording) recSurface?.let { b.addTarget(it) }
+        common(b)
+        return b
     }
 
     /**
@@ -410,7 +530,11 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
             if (!busy && now > holdStatusUntil && now - lastStatusAt > 400) {
                 lastStatusAt = now
                 val r = rawReader
-                status("RAW ${r?.width}×${r?.height} · ${exposureText(result)}")
+                status(when {
+                    recording -> "● ${clock(now - recStartedAt)} · $videoLabel · ${exposureText(result)}"
+                    videoMode -> "$videoLabel · ${exposureText(result)}"
+                    else -> "RAW ${r?.width}×${r?.height} · ${exposureText(result)}"
+                })
             }
         }
     }
@@ -419,9 +543,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         val s = session ?: return
         val d = device ?: return
         try {
-            val b = d.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW)
-            b.addTarget(preview.holder.surface)
-            common(b)
+            val b = newBuilder(d)
             s.setRepeatingRequest(b.build(), previewCallback, cam)
         } catch (e: Exception) {
             status("Falha no visor: ${e.message}")
@@ -454,17 +576,23 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         }
         val w = active.width()
         val h = active.height()
+        // o vídeo 16:9 usa só a faixa central do sensor 4:3
+        var fx = sx
+        var fy = sy
+        if (videoMode) {
+            val sensor = w.toFloat() / h
+            val video = videoSize.width.toFloat() / videoSize.height
+            if (video > sensor) fy = 0.5f + (sy - 0.5f) * sensor / video else fx = 0.5f + (sx - 0.5f) * video / sensor
+        }
         val half = (minOf(w, h) * 0.06f).toInt()
-        val cx = (sx * w).toInt().coerceIn(half, w - half)
-        val cy = (sy * h).toInt().coerceIn(half, h - half)
+        val cx = (fx * w).toInt().coerceIn(half, w - half)
+        val cy = (fy * h).toInt().coerceIn(half, h - half)
         afRegion = MeteringRectangle(cx - half, cy - half, half * 2, half * 2, MeteringRectangle.METERING_WEIGHT_MAX)
         val s = session ?: return
         val d = device ?: return
         try {
             updatePreview()
-            val b = d.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW)
-            b.addTarget(preview.holder.surface)
-            common(b)
+            val b = newBuilder(d)
             b.set(CaptureRequest.CONTROL_AF_TRIGGER, CameraMetadata.CONTROL_AF_TRIGGER_START)
             s.capture(b.build(), null, cam)
         } catch (_: Exception) { }
@@ -478,13 +606,227 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         val s = session ?: return@Runnable
         val d = device ?: return@Runnable
         try {
-            val b = d.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW)
-            b.addTarget(preview.holder.surface)
-            common(b)
+            val b = newBuilder(d)
             b.set(CaptureRequest.CONTROL_AF_TRIGGER, CameraMetadata.CONTROL_AF_TRIGGER_CANCEL)
             s.capture(b.build(), null, cam)
             updatePreview()
         } catch (_: Exception) { }
+    }
+
+    // ------------------------------------------------------------------ vídeo
+
+    private fun clock(ms: Long): String = String.format(Locale.US, "%02d:%02d", ms / 60000, ms / 1000 % 60)
+
+    /** HEVC quando o aparelho codifica esse tamanho a 30 qps; senão H.264. Taxa de bits bem acima da de fábrica. */
+    private fun chooseEncoder(size: Size) {
+        var hevcMax = 0
+        var avcMax = 0
+        try {
+            for (info in MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos) {
+                if (!info.isEncoder) continue
+                for (type in info.supportedTypes) {
+                    val hevc = type.equals(MediaFormat.MIMETYPE_VIDEO_HEVC, true)
+                    if (!hevc && !type.equals(MediaFormat.MIMETYPE_VIDEO_AVC, true)) continue
+                    val vc = try { info.getCapabilitiesForType(type).videoCapabilities } catch (_: Exception) { null } ?: continue
+                    if (!vc.areSizeAndRateSupported(size.width, size.height, 30.0)) continue
+                    val top = vc.bitrateRange.upper
+                    if (hevc) hevcMax = maxOf(hevcMax, top) else avcMax = maxOf(avcMax, top)
+                }
+            }
+        } catch (_: Exception) { }
+        avcCap = avcMax
+        setEncoder(size, hevcMax > 0, if (hevcMax > 0) hevcMax else avcMax)
+    }
+
+    private fun setEncoder(size: Size, hevc: Boolean, cap: Int) {
+        videoHevc = hevc
+        val scale = size.width.toLong() * size.height / (1920.0 * 1080.0)
+        val target = ((if (hevc) 36_000_000 else 48_000_000) * scale).toInt()
+        videoBitrate = if (cap > 0) minOf(target, cap) else minOf(target, 20_000_000)
+        videoLabel = "${size.height}p30 ${if (hevc) "HEVC" else "H.264"} ${videoBitrate / 1_000_000} Mbps"
+    }
+
+    private fun newRecorder(surface: Surface, fd: java.io.FileDescriptor?, path: String?, rotation: Int, audio: Boolean): MediaRecorder {
+        @Suppress("DEPRECATION")
+        val r = if (android.os.Build.VERSION.SDK_INT >= 31) MediaRecorder(this) else MediaRecorder()
+        try {
+            if (audio) r.setAudioSource(MediaRecorder.AudioSource.CAMCORDER)
+            r.setVideoSource(MediaRecorder.VideoSource.SURFACE)
+            r.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
+            if (fd != null) r.setOutputFile(fd) else r.setOutputFile(path)
+            r.setVideoEncodingBitRate(videoBitrate)
+            r.setVideoFrameRate(30)
+            r.setVideoSize(videoSize.width, videoSize.height)
+            r.setVideoEncoder(if (videoHevc) MediaRecorder.VideoEncoder.HEVC else MediaRecorder.VideoEncoder.H264)
+            if (audio) {
+                r.setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
+                r.setAudioEncodingBitRate(192_000)
+                r.setAudioSamplingRate(48_000)
+                r.setAudioChannels(2)
+            }
+            r.setOrientationHint(rotation)
+            r.setInputSurface(surface)
+            r.prepare()
+            return r
+        } catch (e: Exception) {
+            try { r.release() } catch (_: Exception) { }
+            throw e
+        }
+    }
+
+    /** Superfície de entrada do gravador, reaproveitada entre gravações da mesma sessão. */
+    private fun ensureRecSurface(): Surface {
+        recSurface?.let { return it }
+        val s = MediaCodec.createPersistentInputSurface()
+        val tmp = File(cacheDir, "prep.mp4")
+        try {
+            // um gravador descartável só para dar tamanho e formato à superfície
+            try {
+                newRecorder(s, null, tmp.absolutePath, 0, false).release()
+            } catch (e: Exception) {
+                if (!videoHevc) throw e
+                setEncoder(videoSize, false, avcCap)   // o aparelho recusou HEVC nessa configuração: cai para H.264
+                newRecorder(s, null, tmp.absolutePath, 0, false).release()
+            }
+        } catch (e: Exception) {
+            s.release()
+            throw e
+        } finally {
+            tmp.delete()
+        }
+        recSurface = s
+        return s
+    }
+
+    private fun toggleRecord() {
+        cam?.post { if (recording) stopRecording() else startRecording() }
+    }
+
+    private fun startRecording() {
+        val surface = recSurface
+        val c = chars
+        if (session == null || surface == null || c == null || !videoMode || recording) return
+        var uri: Uri? = null
+        var fd: ParcelFileDescriptor? = null
+        try {
+            val name = "BITCAM_" + SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date()) + ".mp4"
+            val v = ContentValues().apply {
+                put(MediaStore.Video.Media.DISPLAY_NAME, name)
+                put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
+                put(MediaStore.Video.Media.RELATIVE_PATH, Environment.DIRECTORY_DCIM + "/BITCAM")
+                put(MediaStore.Video.Media.IS_PENDING, 1)
+            }
+            uri = contentResolver.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, v) ?: throw IllegalStateException("galeria indisponível")
+            fd = contentResolver.openFileDescriptor(uri, "rw") ?: throw IllegalStateException("arquivo indisponível")
+            val sensorOrientation = c.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 90
+            val rotation = if (facing == CameraCharacteristics.LENS_FACING_FRONT) (sensorOrientation - deviceRotation + 360) % 360
+            else (sensorOrientation + deviceRotation) % 360
+            val audio = checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
+            val r = newRecorder(surface, fd.fileDescriptor, null, rotation, audio)
+            try {
+                r.start()
+            } catch (e: Exception) {
+                try { r.release() } catch (_: Exception) { }
+                throw e
+            }
+            recorder = r
+            recUri = uri
+            recFd = fd
+            recStartedAt = SystemClock.elapsedRealtime()
+            unlockUntil = 0
+            holdStatusUntil = 0
+            recording = true
+            updatePreview()
+            ui.post {
+                showMode()
+                if (!audio) hint("Gravando sem áudio (microfone não liberado)")
+            }
+        } catch (e: Exception) {
+            try { fd?.close() } catch (_: Exception) { }
+            try { uri?.let { contentResolver.delete(it, null, null) } } catch (_: Exception) { }
+            holdStatusUntil = SystemClock.elapsedRealtime() + 8000
+            status("Não foi possível gravar: ${e.javaClass.simpleName} ${e.message ?: ""}")
+        }
+    }
+
+    private fun stopRecording() {
+        if (!recording) return
+        recording = false
+        val length = SystemClock.elapsedRealtime() - recStartedAt
+        val r = recorder
+        recorder = null
+        var ok = true
+        try { r?.stop() } catch (_: Exception) { ok = false }   // gravação curta demais lança aqui
+        try { r?.release() } catch (_: Exception) { }
+        try { recFd?.close() } catch (_: Exception) { }
+        recFd = null
+        val uri = recUri
+        recUri = null
+        var small: Bitmap? = null
+        if (uri != null) {
+            try {
+                if (ok) {
+                    publish(uri)
+                    small = try { contentResolver.loadThumbnail(uri, Size(160, 284), null) } catch (_: Exception) { null }
+                } else {
+                    contentResolver.delete(uri, null, null)
+                }
+            } catch (_: Exception) { ok = false }
+        }
+        holdStatusUntil = SystemClock.elapsedRealtime() + 8000
+        status(if (ok) "Vídeo salvo · ${clock(length)} · $videoLabel" else "Gravação curta demais; nada foi salvo.")
+        val saved = ok
+        ui.post {
+            hint(null)
+            showMode()
+            if (saved && uri != null) {
+                lastPhoto = uri
+                lastMime = "video/mp4"
+                small?.let { thumb.setImageBitmap(it) }
+            }
+        }
+        try { updatePreview() } catch (_: Exception) { }
+    }
+
+    /** Durante a gravação travada: solta a exposição e a cor por um instante para se adaptar ao novo ambiente. */
+    private fun readjust() {
+        cam?.post {
+            if (!recording) return@post
+            unlockUntil = SystemClock.elapsedRealtime() + 1500
+            updatePreview()
+            cam?.postDelayed({ if (recording) updatePreview() }, 1600)
+        }
+    }
+
+    private fun setMode(video: Boolean) {
+        if (busy || recording || videoMode == video) return
+        videoMode = video
+        if (video && wbMode == RawProcessor.WB_AUTO) wbMode = RawProcessor.WB_SENSOR   // o Auto BIT depende do RAW
+        showMode()
+        if (video && !askedAudio && checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            askedAudio = true
+            requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), 2)
+        }
+        cam?.post { closeCamera(); openCamera() }
+    }
+
+    private fun showMode() {
+        modePhoto.isSelected = !videoMode
+        modeVideo.isSelected = videoMode
+        modePhoto.isEnabled = !recording
+        modeVideo.isEnabled = !recording
+        flip.isEnabled = !recording
+        videoPanel.visibility = if (videoMode) View.VISIBLE else View.GONE
+        dngBox.visibility = if (videoMode) View.INVISIBLE else View.VISIBLE
+        wbButtons[RawProcessor.WB_AUTO]?.isEnabled = !videoMode
+        vLock.isSelected = lockOnRecord
+        vNatural.isSelected = natural
+        vStab.isSelected = stabilize
+        vReadjust.isEnabled = recording && lockOnRecord
+        shutter.setBackgroundResource(if (videoMode) R.drawable.record else R.drawable.shutter)
+        shutter.isSelected = recording
+        showWb()
+        layoutFrame()
     }
 
     // ------------------------------------------------------------------ captura
@@ -494,7 +836,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
             val s = session
             val d = device
             val reader = rawReader
-            if (s == null || d == null || reader == null || busy) return@post
+            if (s == null || d == null || reader == null || busy || videoMode) return@post
             busy = true
             val token = ++captureToken
             pendingImage?.close()
@@ -584,6 +926,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
                     modeName, (out.kelvin / 10).roundToInt() * 10, out.tint.roundToInt(), exposureText(res), secs, dngNote)
                 ui.post {
                     lastPhoto = uri
+                    lastMime = "image/jpeg"
                     lastEstimate = out.kelvin to out.tint
                     wbLock.isEnabled = true
                     thumb.setImageBitmap(small)
@@ -706,7 +1049,13 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
 
     @SuppressLint("ClickableViewAccessibility")
     private fun setupControls() {
-        shutter.setOnClickListener { shoot() }
+        shutter.setOnClickListener { if (videoMode) toggleRecord() else shoot() }
+        modePhoto.setOnClickListener { setMode(false) }
+        modeVideo.setOnClickListener { setMode(true) }
+        vLock.setOnClickListener { lockOnRecord = !lockOnRecord; showMode(); cam?.post { updatePreview() } }
+        vNatural.setOnClickListener { natural = !natural; showMode(); cam?.post { updatePreview() } }
+        vStab.setOnClickListener { stabilize = !stabilize; showMode(); cam?.post { updatePreview() } }
+        vReadjust.setOnClickListener { readjust() }
         for ((mode, button) in wbButtons) button.setOnClickListener { setWb(mode) }
         wbLock.setOnClickListener {
             lastEstimate?.let { (k, t) ->
@@ -748,14 +1097,14 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         }
         dngBox.setOnCheckedChangeListener { _, on -> saveDng = on }
         flip.setOnClickListener {
-            if (busy) return@setOnClickListener
+            if (busy || recording) return@setOnClickListener
             facing = if (facing == CameraCharacteristics.LENS_FACING_FRONT) CameraCharacteristics.LENS_FACING_BACK else CameraCharacteristics.LENS_FACING_FRONT
             cam?.post { closeCamera(); openCamera() }
         }
         thumb.setOnClickListener {
             val uri = lastPhoto ?: return@setOnClickListener
             try {
-                startActivity(Intent(Intent.ACTION_VIEW).setDataAndType(uri, "image/jpeg").addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION))
+                startActivity(Intent(Intent.ACTION_VIEW).setDataAndType(uri, lastMime).addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION))
             } catch (_: Exception) {
                 status("Nenhum app de galeria abriu a foto. Ela está em DCIM/BITCAM.")
             }
@@ -779,7 +1128,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
 
     override fun onKeyDown(keyCode: Int, event: KeyEvent): Boolean {
         if (keyCode == KeyEvent.KEYCODE_VOLUME_DOWN || keyCode == KeyEvent.KEYCODE_VOLUME_UP || keyCode == KeyEvent.KEYCODE_CAMERA) {
-            if (event.repeatCount == 0) shoot()
+            if (event.repeatCount == 0) { if (videoMode) toggleRecord() else shoot() }
             return true
         }
         return super.onKeyDown(keyCode, event)

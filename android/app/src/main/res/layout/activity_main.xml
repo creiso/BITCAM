@@ -114,6 +114,31 @@
     </LinearLayout>
 
     <HorizontalScrollView
+        android:id="@+id/videoPanel"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:fillViewport="true"
+        android:paddingTop="8dp"
+        android:scrollbars="none"
+        android:visibility="gone">
+
+        <LinearLayout
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_gravity="center_horizontal"
+            android:gravity="center"
+            android:orientation="horizontal"
+            android:paddingStart="8dp"
+            android:paddingEnd="8dp">
+
+            <Button android:id="@+id/vLock" style="@style/Chip" android:text="Travar cor e brilho" />
+            <Button android:id="@+id/vReadjust" style="@style/Chip" android:enabled="false" android:text="Reajustar" />
+            <Button android:id="@+id/vNatural" style="@style/Chip" android:text="Natural" />
+            <Button android:id="@+id/vStab" style="@style/Chip" android:text="Estabilizar" />
+        </LinearLayout>
+    </HorizontalScrollView>
+
+    <HorizontalScrollView
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:fillViewport="true"
@@ -135,6 +160,17 @@
             <Button android:id="@+id/wbLock" style="@style/Chip" android:enabled="false" android:text="Travar último" />
         </LinearLayout>
     </HorizontalScrollView>
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:gravity="center"
+        android:orientation="horizontal"
+        android:paddingTop="8dp">
+
+        <Button android:id="@+id/modePhoto" style="@style/Chip" android:text="Foto" />
+        <Button android:id="@+id/modeVideo" style="@style/Chip" android:text="Vídeo" />
+    </LinearLayout>
 
     <RelativeLayout
         android:layout_width="match_parent"

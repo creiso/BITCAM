@@ -8,6 +8,7 @@
     <color name="dim">#8D9792</color>
     <color name="accent">#7CF5C8</color>
     <color name="accent_ink">#04261B</color>
+    <color name="rec">#FF4B3E</color>
     <style name="AppTheme" parent="android:Theme.Material.NoActionBar">
         <item name="android:windowBackground">@color/black</item>
         <item name="android:statusBarColor">@color/black</item>
