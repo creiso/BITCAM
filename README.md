@@ -58,6 +58,7 @@ Ainda não tem: HDR local e modo noite (Etapa 3), zoom.
 - O resultado segue para a mesma revelação da Etapa 1, que passa a aplicar menos redução de ruído.
 - O JPEG leva no EXIF (ImageDescription) o diagnóstico da revelação: quadros fundidos, ruído medido, balanço de branco, níveis de preto e branco.
 - O DNG vem desligado por padrão: é o negativo cru do primeiro quadro, não a foto final.
+- **Flash** (não / auto / sim): na traseira, o LED fica aceso durante todo o burst, para que todos os quadros tenham a mesma luz; na frontal, a tela fica branca no brilho máximo. O app espera a exposição e a cor se ajustarem à luz do flash antes de disparar. No automático, entra a partir de ISO 1000 no visor. Em vídeo, "sim" mantém o LED aceso enquanto grava.
 - **Inverter**: salva a foto espelhada na horizontal. A escolha é guardada separadamente para a câmera frontal e a traseira.
 
 ### Vídeo V1 — cor, brilho e compressão (atual)

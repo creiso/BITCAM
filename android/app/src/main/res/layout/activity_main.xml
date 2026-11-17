@@ -170,6 +170,7 @@
 
         <Button android:id="@+id/modePhoto" style="@style/Chip" android:text="Foto" />
         <Button android:id="@+id/modeVideo" style="@style/Chip" android:text="Vídeo" />
+        <Button android:id="@+id/flashBtn" style="@style/Chip" android:layout_marginStart="16dp" android:text="Flash: não" />
     </LinearLayout>
 
     <RelativeLayout

@@ -7,6 +7,7 @@ import android.content.ContentValues
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
+import android.graphics.Color
 import android.graphics.ImageFormat
 import android.hardware.camera2.CameraCaptureSession
 import android.hardware.camera2.CameraCharacteristics
@@ -49,6 +50,7 @@ import android.view.Surface
 import android.view.SurfaceHolder
 import android.view.SurfaceView
 import android.view.View
+import android.view.ViewGroup
 import android.view.WindowManager
 import android.widget.Button
 import android.widget.CheckBox
@@ -73,6 +75,13 @@ import kotlin.math.roundToInt
  */
 class MainActivity : Activity(), SurfaceHolder.Callback {
 
+    private companion object {
+        const val FLASH_OFF = 0
+        const val FLASH_AUTO = 1
+        const val FLASH_ON = 2
+        const val FLASH_AUTO_ISO = 1000   // no automático, o flash entra a partir deste ISO no visor
+    }
+
     private lateinit var manager: CameraManager
     private lateinit var preview: SurfaceView
     private lateinit var frame: FrameLayout
@@ -91,6 +100,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     private lateinit var flip: Button
     private lateinit var dngBox: CheckBox
     private lateinit var mirrorBox: CheckBox
+    private lateinit var flashButton: Button
     private lateinit var stage: View
     private lateinit var videoPanel: View
     private lateinit var vLock: Button
@@ -130,6 +140,16 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     private var burstW = 0
     private var burstH = 0
     @Volatile private var lastIso = 400
+
+    // ---- flash: LED aceso durante todo o burst (traseira) ou tela branca no brilho máximo (frontal)
+    @Volatile private var flashMode = FLASH_OFF
+    private var torchOn = false          // LED ligado para a foto (thread "camera")
+    private var flashActive = false      // há um flash em andamento
+    private var flashIsScreen = false
+    private var flashStartedAt = 0L
+    private var flashLitAt = 0L          // quando a luz do flash apareceu de fato nos quadros
+    private var flashSettled = false     // exposição e cor já se ajustaram à luz do flash
+    private var flashOverlay: View? = null
     private var lastStatusAt = 0L
     @Volatile private var holdStatusUntil = 0L   // mantém o resultado da foto legível
 
@@ -192,6 +212,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         flip = findViewById(R.id.flip)
         dngBox = findViewById(R.id.dng)
         mirrorBox = findViewById(R.id.mirror)
+        flashButton = findViewById(R.id.flashBtn)
         stage = findViewById(R.id.stage)
         videoPanel = findViewById(R.id.videoPanel)
         vLock = findViewById(R.id.vLock)
@@ -377,6 +398,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
             ui.post {
                 flip.text = if (facing == CameraCharacteristics.LENS_FACING_FRONT) "Traseira" else "Frontal"
                 mirrorBox.isChecked = getPreferences(MODE_PRIVATE).getBoolean(mirrorKey(), false)
+                showFlash()
             }
             status((if (videoMode) videoLabel else "RAW ${raw.width}×${raw.height}") + " · abrindo…")
         } catch (e: Exception) {
@@ -405,6 +427,9 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         pendingResult = null
         collecting = false
         try { Native.burstClear() } catch (_: Throwable) { }
+        flashActive = false
+        torchOn = false
+        ui.post { screenFlash(false) }
         opening = false
     }
 
@@ -461,6 +486,11 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         }
         if (supports(CameraCharacteristics.LENS_INFO_AVAILABLE_OPTICAL_STABILIZATION, CameraMetadata.LENS_OPTICAL_STABILIZATION_MODE_ON)) {
             b.set(CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE, CameraMetadata.LENS_OPTICAL_STABILIZATION_MODE_ON)
+        }
+        if (hasLed()) {
+            // foto: aceso só durante a captura; vídeo: aceso enquanto grava, se o flash estiver ligado
+            val torch = torchOn || (videoMode && recording && flashMode == FLASH_ON)
+            b.set(CaptureRequest.FLASH_MODE, if (torch) CameraMetadata.FLASH_MODE_TORCH else CameraMetadata.FLASH_MODE_OFF)
         }
         if (videoMode) {
             // taxa de quadros constante
@@ -549,6 +579,19 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
             }
             result.get(CaptureResult.SENSOR_SENSITIVITY)?.let { lastIso = it }
             val now = SystemClock.elapsedRealtime()
+            if (flashActive && !flashSettled) {
+                // a luz precisa estar nos quadros (LED: confirmado pelo resultado; tela: um instante para acender)
+                val lit = if (flashIsScreen) now - flashStartedAt >= 250
+                else result.get(CaptureResult.FLASH_MODE) == CameraMetadata.FLASH_MODE_TORCH
+                if (lit && flashLitAt == 0L) flashLitAt = now
+                val ae = result.get(CaptureResult.CONTROL_AE_STATE)
+                val awb = result.get(CaptureResult.CONTROL_AWB_STATE)
+                val aeOk = ae == CameraMetadata.CONTROL_AE_STATE_CONVERGED || ae == CameraMetadata.CONTROL_AE_STATE_FLASH_REQUIRED
+                val awbOk = result.get(CaptureResult.CONTROL_AWB_MODE) != CameraMetadata.CONTROL_AWB_MODE_AUTO ||
+                    awb == null || awb == CameraMetadata.CONTROL_AWB_STATE_CONVERGED
+                // só vale depois de a câmera ter tido tempo de reagir à luz nova
+                if (flashLitAt != 0L && now - flashLitAt >= 400 && aeOk && awbOk) flashSettled = true
+            }
             if (!busy && now > holdStatusUntil && now - lastStatusAt > 400) {
                 lastStatusAt = now
                 val r = rawReader
@@ -836,12 +879,25 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     private fun showRotation() {
         val angle = when (deviceRotation) { 90 -> -90f; 270 -> 90f; 180 -> 180f; else -> 0f }
         ui.post {
-            for (v in listOf(thumb, flip, dngBox, mirrorBox, modePhoto, modeVideo)) v.animate().rotation(angle).setDuration(150).start()
+            for (v in listOf(thumb, flip, dngBox, mirrorBox, modePhoto, modeVideo, flashButton)) v.animate().rotation(angle).setDuration(150).start()
         }
     }
 
     /** A escolha de inverter é guardada separadamente para a câmera frontal e para a traseira. */
     private fun mirrorKey() = if (facing == CameraCharacteristics.LENS_FACING_FRONT) "mirror_front" else "mirror_back"
+
+    private fun showFlash() {
+        val front = facing == CameraCharacteristics.LENS_FACING_FRONT
+        val led = hasLed()
+        // vídeo: só o LED serve (fica aceso enquanto grava); a tela branca esconderia o visor
+        flashButton.isEnabled = !recording && (if (videoMode) led else led || front)
+        flashButton.isSelected = flashMode != FLASH_OFF
+        flashButton.text = when (flashMode) {
+            FLASH_ON -> "Flash: sim"
+            FLASH_AUTO -> if (videoMode) "Flash: auto (só foto)" else "Flash: auto"
+            else -> "Flash: não"
+        }
+    }
 
     private fun showMode() {
         modePhoto.isSelected = !videoMode
@@ -859,6 +915,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         vReadjust.isEnabled = recording && lockOnRecord
         shutter.setBackgroundResource(if (videoMode) R.drawable.record else R.drawable.shutter)
         shutter.isSelected = recording
+        showFlash()
         showWb()
         layoutFrame()
     }
@@ -874,14 +931,92 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         return n
     }
 
+    private fun hasLed() = chars?.get(CameraCharacteristics.FLASH_INFO_AVAILABLE) == true
+
+    /** Traseira: LED. Frontal: a tela faz de flash. */
+    private fun canFlash() = hasLed() || facing == CameraCharacteristics.LENS_FACING_FRONT
+
+    private fun wantFlash() = canFlash() && (flashMode == FLASH_ON || (flashMode == FLASH_AUTO && lastIso >= FLASH_AUTO_ISO))
+
     private fun shoot() {
         cam?.post {
+            if (session == null || device == null || rawReader == null || busy || videoMode) return@post
+            busy = true
+            val token = ++captureToken
+            ui.post { shutter.isEnabled = false }
+            if (!wantFlash()) {
+                startBurst(token)
+                return@post
+            }
+            // acende, espera a exposição e a cor se ajustarem à luz nova e só então dispara o burst
+            flashActive = true
+            flashSettled = false
+            flashLitAt = 0L
+            flashStartedAt = SystemClock.elapsedRealtime()
+            flashIsScreen = !hasLed()
+            if (flashIsScreen) {
+                ui.post { screenFlash(true) }
+            } else {
+                torchOn = true
+                updatePreview()
+            }
+            ui.post { hint("Flash…") }
+            waitFlash(token)
+        }
+    }
+
+    private fun waitFlash(token: Int) {
+        cam?.postDelayed({
+            if (!busy || token != captureToken) return@postDelayed
+            val elapsed = SystemClock.elapsedRealtime() - flashStartedAt
+            val minimum = if (flashIsScreen) 900 else 500
+            if (elapsed >= minimum && (flashSettled || elapsed >= 2200)) startBurst(token) else waitFlash(token)
+        }, 80)
+    }
+
+    /** Apaga o flash. Pode ser chamado de qualquer thread e mais de uma vez. */
+    private fun endFlash() {
+        val h = cam
+        val off = Runnable {
+            if (!flashActive) return@Runnable
+            flashActive = false
+            if (torchOn) {
+                torchOn = false
+                try { updatePreview() } catch (_: Exception) { }
+            }
+            ui.post { screenFlash(false) }
+        }
+        if (h != null && Looper.myLooper() != h.looper) h.post(off) else off.run()
+    }
+
+    /** Flash da câmera frontal: tela toda branca no brilho máximo. */
+    private fun screenFlash(on: Boolean) {
+        if (on) {
+            val v = flashOverlay ?: View(this).also {
+                it.setBackgroundColor(Color.WHITE)
+                it.isClickable = true   // não deixa tocar nos controles por baixo
+                addContentView(it, ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+                flashOverlay = it
+            }
+            v.visibility = View.VISIBLE
+            window.attributes = window.attributes.apply { screenBrightness = 1f }
+        } else {
+            val v = flashOverlay ?: return
+            if (v.visibility == View.GONE) return
+            v.visibility = View.GONE
+            window.attributes = window.attributes.apply { screenBrightness = WindowManager.LayoutParams.BRIGHTNESS_OVERRIDE_NONE }
+        }
+    }
+
+    private fun startBurst(token: Int) {
+        run {
             val s = session
             val d = device
             val reader = rawReader
-            if (s == null || d == null || reader == null || busy || videoMode) return@post
-            busy = true
-            val token = ++captureToken
+            if (s == null || d == null || reader == null) {
+                finish("Câmera fechada durante a captura.")
+                return
+            }
             pendingImage?.close()
             pendingImage = null
             pendingResult = null
@@ -890,7 +1025,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
             val n = burstSize()
             burstExpected = n
             collecting = true
-            ui.post { shutter.isEnabled = false; hint("Capturando $n quadros… segure firme") }
+            ui.post { hint("Capturando $n quadros… segure firme") }
             try {
                 val b = d.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE)
                 b.addTarget(reader.surface)
@@ -959,6 +1094,8 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         if (!force && (burstGot < burstExpected || res == null)) return
         collecting = false
         captureToken++   // desarma a rede de segurança e ignora quadros atrasados
+        val flashUsed = flashActive
+        endFlash()       // os quadros já chegaram: não precisa ficar aceso durante a revelação
         val img = pendingImage
         pendingImage = null
         pendingResult = null
@@ -981,12 +1118,12 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         val got = burstGot
         val mirror = mirrorPhoto
         ui.post { hint(if (got > 1) "Fundindo $got quadros…" else "Revelando…") }
-        worker.execute { develop(img, w, h, c, res, calibration, rotation, mirror, mode, k, t) }
+        worker.execute { develop(img, w, h, c, res, calibration, rotation, mirror, mode, k, t, flashUsed) }
     }
 
     private fun develop(
         dngImage: Image?, w: Int, h: Int, c: CameraCharacteristics, res: TotalCaptureResult, calibration: FloatArray,
-        rotation: Int, mirror: Boolean, mode: Int, k: Float, t: Float
+        rotation: Int, mirror: Boolean, mode: Int, k: Float, t: Float, flashUsed: Boolean
     ) {
         val t0 = SystemClock.elapsedRealtime()
         val name = "BITCAM_" + SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
@@ -1001,7 +1138,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
             if (out == null) {
                 message = "Não foi possível revelar este RAW" + if (dngNote == " + DNG") " (o DNG foi salvo)." else "."
             } else {
-                val uri = saveJpeg(name, out.bitmap, res, out.debug)
+                val uri = saveJpeg(name, out.bitmap, res, out.debug + " flash=" + (if (flashUsed) 1 else 0), flashUsed)
                 val small = Bitmap.createScaledBitmap(out.bitmap, 160, 160 * out.bitmap.height / out.bitmap.width, true)
                 out.bitmap.recycle()
                 val modeName = when (out.wbUsed) {
@@ -1011,8 +1148,9 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
                 }
                 val secs = (SystemClock.elapsedRealtime() - t0) / 1000f
                 val burstText = if (out.frames > 1) String.format(Locale.US, "%d quadros (%.1f fundidos)", out.frames, out.meanFrames) else "1 quadro"
-                message = String.format(Locale.US, "%s %d K, tint %+d · %s · %s · %.1f s%s",
-                    modeName, (out.kelvin / 10).roundToInt() * 10, out.tint.roundToInt(), exposureText(res), burstText, secs, dngNote)
+                message = String.format(Locale.US, "%s %d K, tint %+d · %s · %s%s · %.1f s%s",
+                    modeName, (out.kelvin / 10).roundToInt() * 10, out.tint.roundToInt(), exposureText(res), burstText,
+                    if (flashUsed) " · flash" else "", secs, dngNote)
                 ui.post {
                     lastPhoto = uri
                     lastMime = "image/jpeg"
@@ -1031,6 +1169,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     }
 
     private fun finish(message: String) {
+        endFlash()
         holdStatusUntil = SystemClock.elapsedRealtime() + 8000
         busy = false
         status(message)
@@ -1076,7 +1215,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         }
     }
 
-    private fun saveJpeg(name: String, bmp: Bitmap, res: CaptureResult, debug: String): Uri {
+    private fun saveJpeg(name: String, bmp: Bitmap, res: CaptureResult, debug: String, flashUsed: Boolean): Uri {
         val uri = insert("$name.jpg", "image/jpeg")
         try {
             contentResolver.openOutputStream(uri)!!.use {
@@ -1090,6 +1229,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
                     val version = try { packageManager.getPackageInfo(packageName, 0).versionName } catch (_: Exception) { null } ?: "?"
                     exif.setAttribute(ExifInterface.TAG_SOFTWARE, "BITCAM $version")
                     exif.setAttribute(ExifInterface.TAG_IMAGE_DESCRIPTION, debug)   // diagnóstico da revelação
+                    exif.setAttribute(ExifInterface.TAG_FLASH, if (flashUsed) "1" else "0")
                     exif.setAttribute(ExifInterface.TAG_DATETIME_ORIGINAL, SimpleDateFormat("yyyy:MM:dd HH:mm:ss", Locale.US).format(Date()))
                     res.get(CaptureResult.SENSOR_SENSITIVITY)?.let { exif.setAttribute(ExifInterface.TAG_ISO_SPEED_RATINGS, it.toString()) }
                     res.get(CaptureResult.SENSOR_EXPOSURE_TIME)?.let { exif.setAttribute(ExifInterface.TAG_EXPOSURE_TIME, (it / 1e9).toString()) }
@@ -1142,6 +1282,12 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     @SuppressLint("ClickableViewAccessibility")
     private fun setupControls() {
         shutter.setOnClickListener { if (videoMode) toggleRecord() else shoot() }
+        flashMode = getPreferences(MODE_PRIVATE).getInt("flash", FLASH_OFF).coerceIn(FLASH_OFF, FLASH_ON)
+        flashButton.setOnClickListener {
+            flashMode = (flashMode + 1) % 3   // não -> auto -> sim
+            getPreferences(MODE_PRIVATE).edit().putInt("flash", flashMode).apply()
+            showFlash()
+        }
         modePhoto.setOnClickListener { setMode(false) }
         modeVideo.setOnClickListener { setMode(true) }
         vLock.setOnClickListener { lockOnRecord = !lockOnRecord; showMode(); cam?.post { updatePreview() } }
