@@ -214,7 +214,7 @@ inline int mirror(int i, int n) {
 struct Tone {
     std::vector<uint8_t> lut;
     float scale;
-    explicit Tone(double gain) : lut(65536) {
+    Tone(double gain, double kS) : lut(65536) {
         const double W = std::max(1.0, gain), k = 0.55;
         // inclinação 1 no joelho: (1-k)·s / (1 - e^{-s(W-k)}) = 1
         double s = 0;
@@ -231,7 +231,7 @@ struct Tone {
             if (x <= k || s == 0) y = std::min(1.0, x);
             else y = k + (1 - k) * (1 - std::exp(-s * (x - k))) / (1 - std::exp(-s * (W - k)));
             y = y <= 0.0031308 ? 12.92 * y : 1.055 * std::pow(y, 1 / 2.4) - 0.055;
-            y = y + 0.20 * y * (1 - y) * (2 * y - 1);
+            y = y + kS * y * (1 - y) * (2 * y - 1);
             lut[i] = (uint8_t)std::lround(std::min(1.0, std::max(0.0, y)) * 255);
         }
         scale = (float)(65535.0 / W);
@@ -286,7 +286,7 @@ bool neutralFor(const ColorCal& cal, float kelvin, float tint, float out[3]) {
     return true;
 }
 
-int toneForTest(float linear, float gain) { Tone t(gain); return t(linear * gain); }
+int toneForTest(float linear, float gain) { Tone t(gain, 0.20); return t(linear * gain); }
 
 bool develop(const uint16_t* raw, const RawParams& p, uint8_t* out, int outStride, RawInfo* info) {
     const int W = p.cropW, H = p.cropH;
@@ -432,15 +432,26 @@ bool develop(const uint16_t* raw, const RawParams& p, uint8_t* out, int outStrid
     for (int i = 0; i < 9; i++) m[i] = (float)M.m[i];
 
     // -------- 4. exposição: leva a média logarítmica da cena a um cinza médio
+    const double look = std::min(1.0f, std::max(0.0f, p.look));
     double ls = 0;
-    int ln = 0;
+    std::vector<float> lums;
+    lums.reserve(blocks.size());
     for (const Block& b : blocks) {
         double yl = 0.25 * std::min(1.0, b.r * g.v[0]) + 0.6 * std::min(1.0, b.g * g.v[1]) + 0.15 * std::min(1.0, b.b * g.v[2]);
-        ls += std::log(std::max(1e-4, yl)); ln++;
+        ls += std::log(std::max(1e-4, yl));
+        lums.push_back((float)yl);
     }
-    double key = ln ? std::exp(ls / ln) : 0.16;
-    float gain = (float)std::min(3.0, std::max(1.0, 0.16 / key));
-    Tone tone(gain);
+    double key = lums.empty() ? 0.16 : std::exp(ls / lums.size());
+    double want = 0.16 / key;
+    if (look > 0 && !lums.empty()) {
+        // cena clara (parede branca, céu): o que é branco tem que chegar perto do branco
+        size_t k = (size_t)(lums.size() * 0.99);
+        std::nth_element(lums.begin(), lums.begin() + k, lums.end());
+        double hi = std::max(0.05f, lums[k]);
+        want = std::max(want, 1 + look * (std::min(1.4, 0.92 / hi) - 1));
+    }
+    float gain = (float)std::min(3.0, std::max(1.0, want));
+    Tone tone(gain, 0.20 + 0.25 * look);
 
     // balanço de branco aplicado no próprio mosaico, com corte em 1
     const float gf[3] = {(float)g.v[0], (float)g.v[1], (float)g.v[2]};
@@ -518,7 +529,32 @@ bool develop(const uint16_t* raw, const RawParams& p, uint8_t* out, int outStrid
     boxBlur16(cb, hw, hh, rad); boxBlur16(cr, hw, hh, rad);
     if (rad > 1) { boxBlur16(cb, hw, hh, rad); boxBlur16(cr, hw, hh, rad); }
 
-    const float amt = 0.6f, core = p.iso >= 1600 ? 4.0f : p.iso >= 400 ? 2.5f : 1.5f, sat = 1.10f;
+    // ruído de luminância: média só dos vizinhos 5x5 parecidos com o centro (preserva bordas)
+    {
+        const int thr = p.iso >= 1600 ? 11 : p.iso >= 800 ? 9 : p.iso >= 400 ? 7 : p.iso >= 200 ? 5 : 4;
+        std::vector<uint8_t> src(Y);
+        parallelRows(H, [&](int y0, int y1) {
+            for (int y = std::max(2, y0); y < std::min(H - 2, y1); y++) {
+                const uint8_t* r[5];
+                for (int k = 0; k < 5; k++) r[k] = &src[(size_t)(y + k - 2) * W];
+                uint8_t* d = &Y[(size_t)y * W];
+                for (int x = 2; x < W - 2; x++) {
+                    int c = r[2][x], sum = 0, cnt = 0;
+                    for (int k = 0; k < 5; k++) {
+                        const uint8_t* q = r[k] + x - 2;
+                        for (int j = 0; j < 5; j++) {
+                            int v = q[j], e = v - c;
+                            if (e <= thr && e >= -thr) { sum += v; cnt++; }
+                        }
+                    }
+                    d[x] = (uint8_t)((sum + cnt / 2) / cnt);
+                }
+            }
+        });
+    }
+
+    const float amt = 0.6f + 0.3f * (float)look, core = p.iso >= 1600 ? 4.0f : p.iso >= 400 ? 2.5f : 1.5f;
+    const float sat = 1.10f + 0.25f * (float)look;
     const int rot = p.rotation;
     parallelRows(H, [&](int y0, int y1) {
         for (int y = y0; y < y1; y++) {

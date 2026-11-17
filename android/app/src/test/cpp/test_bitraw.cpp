@@ -194,6 +194,44 @@ int main() {
         printf("cinza sob 2856K revelado a 6500K: %d %d %d\n", q[0], q[1], q[2]);
         CHECK(q[0] > q[1] + 15 && q[1] > q[2] + 15, "deveria ficar alaranjado");
     }
+    // 3b. Acabamento (look=1): cinzas continuam neutros; cor e contraste aumentam
+    {
+        Shot s = shoot(5500, 0, 8, 6, 2.0);
+        RawParams p = params(s, 0, 8, 6, makeCal(true));
+        p.wbMode = WB_KELVIN; p.kelvin = 5500;
+        std::vector<uint8_t> flat((size_t)p.cropW * p.cropH * 4), punchy(flat.size());
+        RawInfo a, b;
+        develop(s.raw.data(), p, flat.data(), p.cropW * 4, &a);
+        p.look = 1;
+        develop(s.raw.data(), p, punchy.data(), p.cropW * 4, &b);
+        double satA = 0, satB = 0; int neutral = 0, lo = 255, hi = 0;
+        for (int gy = 0; gy < GH; gy++) for (int gx = 0; gx < GW; gx++) {
+            V L = patch(gx, gy);
+            // média de 16x16 no centro da amostra (um pixel só mediria ruído)
+            uint8_t qa[3], qb[3];
+            for (int c = 0; c < 3; c++) {
+                int sa = 0, sb = 0;
+                for (int y = 12; y < 28; y++) for (int x = 12; x < 28; x++) {
+                    size_t i = ((size_t)(gy * PS + y) * GW * PS + gx * PS + x) * 4 + c;
+                    sa += flat[i]; sb += punchy[i];
+                }
+                qa[c] = (uint8_t)(sa / 256); qb[c] = (uint8_t)(sb / 256);
+            }
+            if (L.v[0] == L.v[1] && L.v[1] == L.v[2]) {
+                int n = abs(qb[0] - qb[1]) > abs(qb[2] - qb[1]) ? abs(qb[0] - qb[1]) : abs(qb[2] - qb[1]);
+                if (n > neutral) neutral = n;
+                if (qb[1] < lo) lo = qb[1];
+                if (qb[1] > hi) hi = qb[1];
+            } else {
+                auto sat = [](const uint8_t* q) { int mx = q[0] > q[1] ? (q[0] > q[2] ? q[0] : q[2]) : (q[1] > q[2] ? q[1] : q[2]); int mn = q[0] < q[1] ? (q[0] < q[2] ? q[0] : q[2]) : (q[1] < q[2] ? q[1] : q[2]); return (mx - mn) / (mx + 1.0); };
+                satA += sat(qa); satB += sat(qb);
+            }
+        }
+        printf("acabamento: saturação %.0f%% maior, ganho %.2f -> %.2f, cinzas de %d a %d, neutralidade %d\n", (satB / satA - 1) * 100, a.gain, b.gain, lo, hi, neutral);
+        CHECK(satB > satA * 1.1, "acabamento deveria saturar mais");
+        CHECK(neutral <= 6, "acabamento tirou a neutralidade dos cinzas (%d)", neutral);
+        CHECK(b.gain >= a.gain, "acabamento não deveria escurecer");
+    }
     // 4. Rotação: tamanhos e cantos
     {
         Shot s = shoot(5500, 0, 0, 0, 0);

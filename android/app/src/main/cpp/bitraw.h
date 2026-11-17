@@ -27,6 +27,7 @@ struct RawParams {
     float neutral[3];       // SENSOR_NEUTRAL_COLOR_POINT (modo WB_SENSOR e prior do automático)
     float kelvin, tint;     // modo WB_KELVIN; tint: + = magenta
     ColorCal cal;
+    float look;             // 0 = revelação neutra (fiel); 1 = acabamento padrão: mais contraste, cor e brilho
     int shCols, shRows;     // mapa de sombreamento da lente (0 = sem mapa)
     const float* shading;   // [linhas][colunas][R, Gpar, Gímpar, B]
 };

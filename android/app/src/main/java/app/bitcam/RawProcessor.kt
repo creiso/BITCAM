@@ -15,7 +15,7 @@ object RawProcessor {
     const val WB_SENSOR = 1
     const val WB_KELVIN = 2
 
-    const val FP_LEN = 66
+    const val FP_LEN = 67
     private const val FP_CAL = 10
 
     class Result(val bitmap: Bitmap, val kelvin: Float, val tint: Float, val gain: Float, val wbUsed: Int)
@@ -109,6 +109,7 @@ object RawProcessor {
         for (i in 0 until 3) fp[5 + i] = neutral?.getOrNull(i)?.toFloat()?.takeIf { it.isFinite() } ?: 0f
         fp[8] = kelvin
         fp[9] = tint
+        fp[66] = 1f   // acabamento padrão
 
         val map = r.get(CaptureResult.STATISTICS_LENS_SHADING_CORRECTION_MAP)
         var shading: FloatArray? = null
