@@ -47,7 +47,17 @@ Para usar no celular, publique a pasta em qualquer hospedagem estática com HTTP
 - Salva JPEG e, opcionalmente, o DNG em `DCIM/BITCAM`.
 - Toque para focar; botões de volume disparam.
 
-Ainda não tem: fusão de burst (Etapa 2), HDR local e modo noite (Etapa 3), zoom.
+Ainda não tem: HDR local e modo noite (Etapa 3), zoom.
+
+### Etapa 2 — fusão de burst RAW (atual)
+
+- Cada foto são 4, 6 ou 8 quadros RAW (mais quadros quanto maior o ISO), com exposição e cor travadas.
+- A referência é o quadro mais nítido dos três primeiros.
+- Alinhamento em pirâmide: global e depois por blocos, para absorver rotação leve da mão e paralaxe.
+- Fusão por pixel com rejeição de movimento: cada quadro só entra onde a diferença para a referência, medida nas quatro amostras Bayer, é compatível com o ruído. O ruído é medido nos próprios quadros.
+- O resultado segue para a mesma revelação da Etapa 1, que passa a aplicar menos redução de ruído.
+- O JPEG leva no EXIF (ImageDescription) o diagnóstico da revelação: quadros fundidos, ruído medido, balanço de branco, níveis de preto e branco.
+- O DNG vem desligado por padrão: é o negativo cru do primeiro quadro, não a foto final.
 
 ### Vídeo V1 — cor, brilho e compressão (atual)
 

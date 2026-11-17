@@ -2,6 +2,9 @@
 #include <jni.h>
 #include <android/bitmap.h>
 #include <cstring>
+#include <mutex>
+#include <new>
+#include <vector>
 #include "bitraw.h"
 
 using namespace bitraw;
@@ -23,14 +26,54 @@ void fillCal(const jfloat* f, ColorCal& c) {
 }
 } // namespace
 
-extern "C" JNIEXPORT jfloatArray JNICALL
-Java_app_bitcam_Native_develop(JNIEnv* env, jclass, jobject rawBuf, jintArray jip, jfloatArray jfp,
-                               jfloatArray jsh, jobject bitmap) {
-    if (!rawBuf || !jip || !jfp || !bitmap) return nullptr;
-    if (env->GetArrayLength(jip) < IP_LEN || env->GetArrayLength(jfp) < FP_LEN) return nullptr;
-    const auto* raw = static_cast<const uint16_t*>(env->GetDirectBufferAddress(rawBuf));
+// Quadros do burst em memória nativa, entre burstAdd e burstDevelop (uma captura por vez).
+namespace {
+std::mutex g_lock;
+std::vector<std::vector<uint16_t>> g_frames;
+int g_w = 0, g_h = 0, g_stride = 0;
+const int MAX_FRAMES = 12;
+} // namespace
+
+extern "C" JNIEXPORT void JNICALL
+Java_app_bitcam_Native_burstClear(JNIEnv*, jclass) {
+    std::lock_guard<std::mutex> l(g_lock);
+    g_frames.clear();
+    g_frames.shrink_to_fit();
+    g_w = g_h = g_stride = 0;
+}
+
+// Copia um quadro RAW. Devolve quantos quadros há guardados, ou -1 se este foi recusado.
+extern "C" JNIEXPORT jint JNICALL
+Java_app_bitcam_Native_burstAdd(JNIEnv* env, jclass, jobject rawBuf, jint w, jint h, jint stride) {
+    if (!rawBuf || w <= 0 || h <= 0 || stride < w * 2 || (stride & 1)) return -1;
+    const auto* raw = static_cast<const uint8_t*>(env->GetDirectBufferAddress(rawBuf));
     const jlong cap = env->GetDirectBufferCapacity(rawBuf);
-    if (!raw || cap <= 0) return nullptr;
+    const jlong need = (jlong)stride * (h - 1) + (jlong)w * 2;
+    if (!raw || cap < need) return -1;
+    std::lock_guard<std::mutex> l(g_lock);
+    if (g_frames.empty()) { g_w = w; g_h = h; g_stride = stride; }
+    else if (w != g_w || h != g_h || stride != g_stride) return -1;
+    if ((int)g_frames.size() >= MAX_FRAMES) return -1;
+    try {
+        std::vector<uint16_t> f((size_t)stride / 2 * h);
+        memcpy(f.data(), raw, (size_t)need);
+        g_frames.push_back(std::move(f));
+    } catch (const std::bad_alloc&) {
+        return -1;   // sem memória: segue com os quadros que já temos
+    }
+    return (jint)g_frames.size();
+}
+
+// Funde os quadros guardados e revela. Devolve [kelvin, tint, ganho, modo de WB, confiança,
+// quadros, média de quadros por pixel, índice da referência, ruído] e libera os quadros.
+extern "C" JNIEXPORT jfloatArray JNICALL
+Java_app_bitcam_Native_burstDevelop(JNIEnv* env, jclass, jintArray jip, jfloatArray jfp,
+                                    jfloatArray jsh, jobject bitmap) {
+    std::lock_guard<std::mutex> l(g_lock);
+    std::vector<std::vector<uint16_t>> frames;
+    frames.swap(g_frames);   // libera ao sair, dê certo ou não
+    if (frames.empty() || !jip || !jfp || !bitmap) return nullptr;
+    if (env->GetArrayLength(jip) < IP_LEN || env->GetArrayLength(jfp) < FP_LEN) return nullptr;
 
     jint ip[IP_LEN];
     jfloat fp[FP_LEN];
@@ -39,7 +82,7 @@ Java_app_bitcam_Native_develop(JNIEnv* env, jclass, jobject rawBuf, jintArray ji
 
     RawParams p;
     memset(&p, 0, sizeof p);
-    p.width = ip[0]; p.height = ip[1]; p.stride = ip[2]; p.cfa = ip[3];
+    p.width = g_w; p.height = g_h; p.stride = g_stride; p.cfa = ip[3];
     p.cropX = ip[4]; p.cropY = ip[5]; p.cropW = ip[6]; p.cropH = ip[7];
     p.rotation = ip[8]; p.wbMode = ip[9]; p.iso = ip[10];
     p.shCols = ip[11]; p.shRows = ip[12];
@@ -49,9 +92,7 @@ Java_app_bitcam_Native_develop(JNIEnv* env, jclass, jobject rawBuf, jintArray ji
     p.kelvin = fp[8]; p.tint = fp[9];
     p.look = fp[66];
     fillCal(fp, p.cal);
-
-    if (p.width <= 0 || p.height <= 0 || p.stride < p.width * 2) return nullptr;
-    if ((jlong)p.stride * (p.height - 1) + (jlong)p.width * 2 > cap) return nullptr;
+    if (ip[0] != g_w || ip[1] != g_h) return nullptr;
 
     jfloat* sh = nullptr;
     if (jsh && p.shCols >= 2 && p.shRows >= 2 && env->GetArrayLength(jsh) >= p.shCols * p.shRows * 4) {
@@ -68,14 +109,32 @@ Java_app_bitcam_Native_develop(JNIEnv* env, jclass, jobject rawBuf, jintArray ji
     if (AndroidBitmap_getInfo(env, bitmap, &bi) == ANDROID_BITMAP_RESULT_SUCCESS &&
         bi.format == ANDROID_BITMAP_FORMAT_RGBA_8888 && (int)bi.width == ow && (int)bi.height == oh &&
         AndroidBitmap_lockPixels(env, bitmap, &pixels) == ANDROID_BITMAP_RESULT_SUCCESS && pixels) {
+        std::vector<const uint16_t*> ptrs;
+        for (auto& f : frames) ptrs.push_back(f.data());
         RawInfo info;
+        BurstInfo burst;
         memset(&info, 0, sizeof info);
-        bool ok = develop(raw, p, static_cast<uint8_t*>(pixels), (int)bi.stride, &info);
+        memset(&burst, 0, sizeof burst);
+        bool ok = false;
+        try {
+            ok = developBurst(ptrs.data(), (int)ptrs.size(), p, static_cast<uint8_t*>(pixels), (int)bi.stride, &info, &burst);
+        } catch (const std::bad_alloc&) {
+            // sem memória para a fusão: revela só o primeiro quadro
+            try {
+                frames.resize(1);
+                frames.shrink_to_fit();
+                ok = develop(frames[0].data(), p, static_cast<uint8_t*>(pixels), (int)bi.stride, &info);
+                burst.frames = 1; burst.meanWeight = 1; burst.refIndex = 0; burst.noise = 0;
+            } catch (const std::bad_alloc&) {
+                ok = false;
+            }
+        }
         AndroidBitmap_unlockPixels(env, bitmap);
         if (ok) {
-            const jfloat out[5] = {info.kelvin, info.tint, info.gain, (jfloat)info.wbUsed, info.confidence};
-            result = env->NewFloatArray(5);
-            if (result) env->SetFloatArrayRegion(result, 0, 5, out);
+            const jfloat out[9] = {info.kelvin, info.tint, info.gain, (jfloat)info.wbUsed, info.confidence,
+                                   (jfloat)burst.frames, burst.meanWeight, (jfloat)burst.refIndex, burst.noise};
+            result = env->NewFloatArray(9);
+            if (result) env->SetFloatArrayRegion(result, 0, 9, out);
         }
     }
     if (sh) env->ReleaseFloatArrayElements(jsh, sh, JNI_ABORT);

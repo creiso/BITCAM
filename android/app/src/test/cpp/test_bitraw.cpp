@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 #include <vector>
 
 using namespace bitraw;
@@ -263,6 +264,105 @@ int main() {
         RawInfo info;
         CHECK(develop(s.raw.data(), p, out.data(), p.cropW * 4, &info) && info.wbUsed == WB_SENSOR, "sem calibração deveria usar o sensor");
         printf("validação ok\n");
+    }
+    // 6. Burst: 8 quadros com tremor (deslocamentos pares e ímpares + leve rotação), ruído forte
+    //    dependente do sinal e um objeto que se move. A fusão tem que reduzir o ruído sem borrar
+    //    a textura e sem deixar fantasma.
+    {
+        const int BW = 1600, BH = 1200, N = 8;
+        const int SX[N] = {0, 3, -5, 8, -2, 1, -9, 4}, SY[N] = {0, -2, 4, 1, -7, 6, -3, 5};
+        const double T = 5000;
+        static const int CF[4] = {0, 1, 1, 2};
+        V white = planckXYZ(T);
+        M toCam = mm(cmAt(T), mm(bradford(D50, white), inv(SRGB)));
+        V neutral = mv(cmAt(T), white);
+        auto scene = [&](double x, double y, int k) {
+            int gx = ((int)floor(x / 64) % GW + GW) % GW, gy = ((int)floor(y / 64) % GH + GH) % GH;
+            V c = patch(gx, gy);
+            if (x > BW / 2) {   // metade direita com textura fina
+                double t = 1 + 0.30 * sin(0.60 * x) * sin(0.52 * y);
+                for (double& v : c.v) v *= t;
+            }
+            double ddx = x - (150 + 55.0 * k), ddy = y - 300;
+            if (ddx * ddx + ddy * ddy < 40 * 40) c = V{{0.75, 0.08, 0.06}};   // objeto em movimento
+            return c;
+        };
+        auto frame = [&](int k, bool noisy) {
+            std::vector<uint16_t> r((size_t)BW * BH);
+            double th = k * 0.0004, cs = cos(th), sn = sin(th);
+            for (int y = 0; y < BH; y++) for (int x = 0; x < BW; x++) {
+                double ux = x - BW / 2.0, uy = y - BH / 2.0;
+                double px = cs * ux - sn * uy + BW / 2.0 + SX[k], py = sn * ux + cs * uy + BH / 2.0 + SY[k];
+                V cam = mv(toCam, scene(px, py, k));
+                double v = cam.v[CF[((y & 1) << 1) | (x & 1)]] * EXPO * (WHITE - BLACK);
+                if (v < 0) v = 0;
+                if (noisy) v += gauss() * sqrt(0.6 * v + 9);
+                v += BLACK;
+                r[(size_t)y * BW + x] = (uint16_t)(v < 0 ? 0 : v > WHITE ? WHITE : lround(v));
+            }
+            return r;
+        };
+        std::vector<std::vector<uint16_t>> fr;
+        for (int k = 0; k < N; k++) fr.push_back(frame(k, true));
+        const uint16_t* ptr[N];
+        for (int k = 0; k < N; k++) ptr[k] = fr[k].data();
+
+        RawParams p; memset(&p, 0, sizeof p);
+        p.width = BW; p.height = BH; p.stride = BW * 2; p.cfa = 0;
+        p.cropW = BW; p.cropH = BH; p.iso = 100; p.white = WHITE;
+        for (int i = 0; i < 4; i++) p.black[i] = BLACK;
+        for (int i = 0; i < 3; i++) p.neutral[i] = (float)neutral.v[i];
+        p.cal = makeCal(true); p.wbMode = WB_KELVIN; p.kelvin = (float)T;
+
+        std::vector<uint8_t> merged((size_t)BW * BH * 4), single(merged.size()), clean(merged.size());
+        RawInfo info; BurstInfo bi;
+        CHECK(developBurst(ptr, N, p, merged.data(), BW * 4, &info, &bi), "developBurst retornou false");
+        std::vector<uint16_t> cleanRaw = frame(bi.refIndex, false);
+        develop(fr[bi.refIndex].data(), p, single.data(), BW * 4, nullptr);
+        develop(cleanRaw.data(), p, clean.data(), BW * 4, nullptr);
+
+        auto rms = [&](const std::vector<uint8_t>& im, int x0, int x1, int y0, int y1) {
+            double e = 0; long c = 0;
+            for (int y = y0; y < y1; y++) for (int x = x0; x < x1; x++) for (int ch = 0; ch < 3; ch++) {
+                double d = (double)im[((size_t)y * BW + x) * 4 + ch] - clean[((size_t)y * BW + x) * 4 + ch];
+                e += d * d; c++;
+            }
+            return sqrt(e / c);
+        };
+        double fs = rms(single, 40, BW / 2 - 40, 420, BH - 40), fm = rms(merged, 40, BW / 2 - 40, 420, BH - 40);
+        double ts = rms(single, BW / 2 + 40, BW - 40, 40, BH - 40), tm = rms(merged, BW / 2 + 40, BW - 40, 40, BH - 40);
+        printf("burst: ref=%d, média de %.1f quadros por pixel, ruído medido %.1f DN\n", bi.refIndex, bi.meanWeight, bi.noise);
+        printf("burst: erro área lisa %.2f -> %.2f | textura %.2f -> %.2f\n", fs, fm, ts, tm);
+        CHECK(bi.meanWeight > 4.5, "poucos quadros aproveitados (%.2f)", bi.meanWeight);
+        CHECK(fm < fs * 0.55, "ruído em área lisa não caiu o bastante");
+        CHECK(tm < ts * 0.80, "textura: a fusão deveria melhorar, não borrar");
+        // fantasma: onde o objeto passou nos outros quadros deve ficar o fundo
+        double worst = 0;
+        for (int k = 0; k < N; k++) {
+            if (k == bi.refIndex) continue;
+            // posição do objeto do quadro k, vista no quadro de referência (aproximação: só o deslocamento)
+            int cx = 150 + 55 * k - SX[bi.refIndex], cy = 300 - SY[bi.refIndex];
+            if (abs(cx - (150 + 55 * bi.refIndex - SX[bi.refIndex])) < 90) continue;   // sobrepõe o objeto da referência
+            for (int ch = 0; ch < 3; ch++) {
+                double a = 0, b = 0;
+                for (int y = cy - 12; y < cy + 12; y++) for (int x = cx - 12; x < cx + 12; x++) {
+                    a += merged[((size_t)y * BW + x) * 4 + ch]; b += clean[((size_t)y * BW + x) * 4 + ch];
+                }
+                worst = fmax(worst, fabs(a - b) / 576);
+            }
+        }
+        printf("burst: maior desvio onde o objeto passou = %.1f níveis\n", worst);
+        CHECK(worst < 6, "fantasma do objeto em movimento");
+        if (getenv("DUMP")) {
+            for (int which = 0; which < 2; which++) {
+                std::string name = std::string(getenv("DUMP")) + (which ? ".burst.ppm" : ".single.ppm");
+                FILE* f = fopen(name.c_str(), "wb");
+                const std::vector<uint8_t>& im = which ? merged : single;
+                fprintf(f, "P6\n%d %d\n255\n", 700, 500);
+                for (int y = 100; y < 600; y++) for (int x = 450; x < 1150; x++) fwrite(&im[((size_t)y * BW + x) * 4], 1, 3, f);
+                fclose(f);
+            }
+        }
     }
     // imagem para inspeção visual
     if (getenv("DUMP")) {

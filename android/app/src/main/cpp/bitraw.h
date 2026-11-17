@@ -39,11 +39,23 @@ struct RawInfo {
     float confidence;       // 0..1, do automático
 };
 
+struct BurstInfo {
+    int frames;             // quadros recebidos
+    int refIndex;           // quadro escolhido como referência (o mais nítido dos primeiros)
+    float meanWeight;       // quantos quadros, em média, entraram em cada pixel (1 = só a referência)
+    float noise;            // ruído medido entre quadros (DN, no cinza de meia resolução, tom médio)
+};
+
 // Tamanho da saída depois do recorte e da rotação.
 void outputSize(const RawParams& p, int* w, int* h);
 
 // Revela para RGBA8 (R,G,B,A em bytes). outStride em bytes. Retorna false se os parâmetros forem inválidos.
 bool develop(const uint16_t* raw, const RawParams& p, uint8_t* out, int outStride, RawInfo* info);
+
+// Burst: alinha os quadros RAW (mesma geometria e exposição) por blocos, funde com rejeição de
+// movimento e revela o resultado. Com n = 1 equivale a develop().
+bool developBurst(const uint16_t* const* frames, int n, const RawParams& p, uint8_t* out, int outStride,
+                  RawInfo* info, BurstInfo* burst);
 
 // Ponto neutro da câmera (normalizado, máx = 1) para um iluminante em Kelvin + tint.
 bool neutralFor(const ColorCal& cal, float kelvin, float tint, float out[3]);

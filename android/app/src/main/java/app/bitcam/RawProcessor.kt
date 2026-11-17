@@ -6,7 +6,6 @@ import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraMetadata
 import android.hardware.camera2.CaptureResult
 import android.hardware.camera2.params.ColorSpaceTransform
-import android.media.Image
 import android.util.Rational
 
 /** Empacota os metadados do Camera2 no formato que a revelação nativa espera. */
@@ -18,7 +17,10 @@ object RawProcessor {
     const val FP_LEN = 67
     private const val FP_CAL = 10
 
-    class Result(val bitmap: Bitmap, val kelvin: Float, val tint: Float, val gain: Float, val wbUsed: Int)
+    class Result(
+        val bitmap: Bitmap, val kelvin: Float, val tint: Float, val gain: Float, val wbUsed: Int,
+        val frames: Int, val meanFrames: Float, val refIndex: Int, val noise: Float, val debug: String
+    )
 
     /** Calibração de cor do sensor (fixa por câmera). As posições 0..9 ficam para a captura. */
     fun calibration(c: CameraCharacteristics): FloatArray {
@@ -79,15 +81,11 @@ object RawProcessor {
         return Rect(0, 0, w, h)
     }
 
+    /** Funde e revela os quadros já entregues a [Native.burstAdd] (todos de [w]×[h]). */
     fun develop(
-        image: Image, c: CameraCharacteristics, r: CaptureResult, cal: FloatArray,
+        w: Int, h: Int, c: CameraCharacteristics, r: CaptureResult, cal: FloatArray,
         rotation: Int, wbMode: Int, kelvin: Float, tint: Float
     ): Result? {
-        val w = image.width
-        val h = image.height
-        val plane = image.planes[0]
-        val buf = plane.buffer
-        buf.rewind()
         val crop = cropFor(c, w, h)
 
         val fp = cal.copyOf()
@@ -128,7 +126,7 @@ object RawProcessor {
         if (cfa !in 0..3) return null   // sensor mono ou NIR: fora do escopo
 
         val ip = intArrayOf(
-            w, h, plane.rowStride, cfa,
+            w, h, 0, cfa,
             crop.left, crop.top, crop.width(), crop.height(),
             rotation, wbMode, iso, shCols, shRows
         )
@@ -138,11 +136,21 @@ object RawProcessor {
             if (swap) crop.width() else crop.height(),
             Bitmap.Config.ARGB_8888
         )
-        val info = Native.develop(buf, ip, fp, shading, bmp)
+        val info = Native.burstDevelop(ip, fp, shading, bmp)
         if (info == null) {
             bmp.recycle()
             return null
         }
-        return Result(bmp, info[0], info[1], info[2], info[3].toInt())
+        // diagnóstico gravado no EXIF: é o que permite afinar a revelação a partir de uma foto enviada
+        val noiseProfile = r.get(CaptureResult.SENSOR_NOISE_PROFILE)
+            ?.joinToString(",") { String.format(java.util.Locale.US, "%.2e/%.2e", it.first, it.second) } ?: "-"
+        val debug = String.format(java.util.Locale.US,
+            "frames=%d mean=%.2f ref=%d noise=%.1f wb=%d K=%.0f tint=%.1f gain=%.2f black=%.1f/%.1f/%.1f/%.1f white=%.0f " +
+                "neutral=%.4f/%.4f/%.4f cfa=%d iso=%d crop=%d,%d,%d,%d raw=%dx%d shading=%dx%d dynBlack=%s np=%s",
+            info[5].toInt(), info[6], info[7].toInt(), info[8], info[3].toInt(), info[0], info[1], info[2],
+            fp[0], fp[1], fp[2], fp[3], fp[4], fp[5], fp[6], fp[7], cfa, iso,
+            crop.left, crop.top, crop.width(), crop.height(), w, h, shCols, shRows,
+            if (dynBlack != null) "s" else "n", noiseProfile)
+        return Result(bmp, info[0], info[1], info[2], info[3].toInt(), info[5].toInt(), info[6], info[7].toInt(), info[8], debug)
     }
 }

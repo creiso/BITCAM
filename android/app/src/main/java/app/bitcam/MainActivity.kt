@@ -123,6 +123,12 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     private var pendingImage: Image? = null
     private var pendingResult: TotalCaptureResult? = null
     private var captureToken = 0
+    private var collecting = false   // recebendo os quadros de um burst
+    private var burstExpected = 0
+    private var burstGot = 0
+    private var burstW = 0
+    private var burstH = 0
+    @Volatile private var lastIso = 400
     private var lastStatusAt = 0L
     @Volatile private var holdStatusUntil = 0L   // mantém o resultado da foto legível
 
@@ -155,7 +161,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     @Volatile private var kelvin = 5200f
     @Volatile private var tint = 0f
     @Volatile private var deviceRotation = 0
-    @Volatile private var saveDng = true
+    @Volatile private var saveDng = false   // o DNG é o negativo cru, não a foto final: só para quem edita RAW
     private var lastEstimate: Pair<Float, Float>? = null
     private var lastPhoto: Uri? = null
     private var resumed = false
@@ -341,7 +347,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
             val ps = previewSize
             ui.post { preview.holder.setFixedSize(ps.width, ps.height) }
 
-            rawReader = ImageReader.newInstance(raw.width, raw.height, ImageFormat.RAW_SENSOR, 2).apply {
+            rawReader = ImageReader.newInstance(raw.width, raw.height, ImageFormat.RAW_SENSOR, 5).apply {
                 setOnImageAvailableListener({ r -> onRawImage(r) }, cam)
             }
             opening = true
@@ -391,6 +397,8 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         pendingImage?.close()
         pendingImage = null
         pendingResult = null
+        collecting = false
+        try { Native.burstClear() } catch (_: Throwable) { }
         opening = false
     }
 
@@ -533,6 +541,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
             if (result.get(CaptureResult.CONTROL_AWB_MODE) == CameraMetadata.CONTROL_AWB_MODE_AUTO) {
                 result.get(CaptureResult.COLOR_CORRECTION_TRANSFORM)?.let { lastTransform = it }
             }
+            result.get(CaptureResult.SENSOR_SENSITIVITY)?.let { lastIso = it }
             val now = SystemClock.elapsedRealtime()
             if (!busy && now > holdStatusUntil && now - lastStatusAt > 400) {
                 lastStatusAt = now
@@ -846,6 +855,15 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
 
     // ------------------------------------------------------------------ captura
 
+    /** Quantos quadros fundir: mais em pouca luz, onde o ruído é maior. */
+    private fun burstSize(): Int {
+        val iso = lastIso
+        var n = if (iso >= 800) 8 else if (iso >= 200) 6 else 4
+        val r = rawReader
+        if (r != null && r.width.toLong() * r.height > 20_000_000L) n = minOf(n, 4)   // sensores enormes: poupa memória
+        return n
+    }
+
     private fun shoot() {
         cam?.post {
             val s = session
@@ -857,7 +875,12 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
             pendingImage?.close()
             pendingImage = null
             pendingResult = null
-            ui.post { shutter.isEnabled = false; hint("Capturando RAW…") }
+            burstGot = 0
+            try { Native.burstClear() } catch (_: Throwable) { }
+            val n = burstSize()
+            burstExpected = n
+            collecting = true
+            ui.post { shutter.isEnabled = false; hint("Capturando $n quadros… segure firme") }
             try {
                 val b = d.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE)
                 b.addTarget(reader.surface)
@@ -866,20 +889,31 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
                 if (supports(CameraCharacteristics.HOT_PIXEL_AVAILABLE_HOT_PIXEL_MODES, CameraMetadata.HOT_PIXEL_MODE_HIGH_QUALITY)) {
                     b.set(CaptureRequest.HOT_PIXEL_MODE, CameraMetadata.HOT_PIXEL_MODE_HIGH_QUALITY)
                 }
-                s.capture(b.build(), object : CameraCaptureSession.CaptureCallback() {
+                // todos os quadros do burst com a mesma exposição e a mesma cor
+                if (chars?.get(CameraCharacteristics.CONTROL_AE_LOCK_AVAILABLE) == true) b.set(CaptureRequest.CONTROL_AE_LOCK, true)
+                if (b.get(CaptureRequest.CONTROL_AWB_MODE) == CameraMetadata.CONTROL_AWB_MODE_AUTO &&
+                    chars?.get(CameraCharacteristics.CONTROL_AWB_LOCK_AVAILABLE) == true) {
+                    b.set(CaptureRequest.CONTROL_AWB_LOCK, true)
+                }
+                val request = b.build()
+                val callback = object : CameraCaptureSession.CaptureCallback() {
                     override fun onCaptureCompleted(ses: CameraCaptureSession, request: CaptureRequest, result: TotalCaptureResult) {
                         if (token != captureToken) return
-                        pendingResult = result
-                        processIfReady()
+                        if (pendingResult == null) pendingResult = result
+                        processIfReady(false)
                     }
 
                     override fun onCaptureFailed(ses: CameraCaptureSession, request: CaptureRequest, failure: CaptureFailure) {
-                        if (token == captureToken) finish("A câmera não entregou a foto. Tente de novo.")
+                        if (token != captureToken) return
+                        burstExpected--   // segue com os quadros que vierem
+                        if (burstExpected <= 0) finish("A câmera não entregou a foto. Tente de novo.") else processIfReady(false)
                     }
-                }, cam)
-                // rede de segurança: se o quadro nunca chegar, libera o disparador
-                cam?.postDelayed({ if (busy && token == captureToken && (pendingImage == null || pendingResult == null)) finish("A câmera demorou demais para entregar o RAW.") }, 8000)
+                }
+                if (n > 1) s.captureBurst(List(n) { request }, callback, cam) else s.capture(request, callback, cam)
+                // rede de segurança: se faltar quadro, funde os que chegaram; se não veio nenhum, libera o disparador
+                cam?.postDelayed({ if (busy && token == captureToken) processIfReady(true) }, 10000)
             } catch (e: Exception) {
+                collecting = false
                 finish("Falha na captura: ${e.message}")
             }
         }
@@ -887,19 +921,44 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
 
     private fun onRawImage(reader: ImageReader) {
         val img = try { reader.acquireNextImage() } catch (_: Exception) { null } ?: return
-        if (!busy || pendingImage != null) { img.close(); return }
-        pendingImage = img
-        processIfReady()
+        if (!busy || !collecting || burstGot >= burstExpected) { img.close(); return }
+        var stored = false
+        try {
+            val plane = img.planes[0]
+            val count = Native.burstAdd(plane.buffer, img.width, img.height, plane.rowStride)
+            if (count > 0) {
+                burstGot = count
+                burstW = img.width
+                burstH = img.height
+                stored = true
+            } else {
+                burstExpected--   // quadro recusado (geometria diferente ou sem memória)
+            }
+        } catch (_: Throwable) {
+            burstExpected--
+        }
+        // o DNG, quando pedido, é o primeiro quadro: a imagem fica aberta até ser gravada
+        if (stored && saveDng && pendingImage == null && burstGot == 1) pendingImage = img else img.close()
+        if (burstExpected <= 0 && burstGot == 0) { collecting = false; finish("Não foi possível guardar o RAW."); return }
+        processIfReady(false)
     }
 
-    private fun processIfReady() {
-        val img = pendingImage ?: return
-        val res = pendingResult ?: return
-        val c = chars
+    private fun processIfReady(force: Boolean) {
+        if (!busy || !collecting) return
+        val res = pendingResult
+        if (!force && (burstGot < burstExpected || res == null)) return
+        collecting = false
+        captureToken++   // desarma a rede de segurança e ignora quadros atrasados
+        val img = pendingImage
         pendingImage = null
         pendingResult = null
-        captureToken++   // desarma a rede de segurança
-        if (c == null) { img.close(); finish("Câmera fechada durante a captura."); return }
+        val c = chars
+        if (res == null || burstGot < 1 || c == null) {
+            img?.close()
+            try { Native.burstClear() } catch (_: Throwable) { }
+            finish(if (c == null) "Câmera fechada durante a captura." else "A câmera demorou demais para entregar o RAW.")
+            return
+        }
         val calibration = cal
         val isFront = facing == CameraCharacteristics.LENS_FACING_FRONT
         val sensorOrientation = c.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 90
@@ -907,28 +966,31 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         val mode = wbMode
         val k = kelvin
         val t = tint
-        val dng = saveDng
-        ui.post { hint("Revelando…") }
-        worker.execute { develop(img, c, res, calibration, rotation, mode, k, t, dng) }
+        val w = burstW
+        val h = burstH
+        val got = burstGot
+        ui.post { hint(if (got > 1) "Fundindo $got quadros…" else "Revelando…") }
+        worker.execute { develop(img, w, h, c, res, calibration, rotation, mode, k, t) }
     }
 
     private fun develop(
-        img: Image, c: CameraCharacteristics, res: TotalCaptureResult, calibration: FloatArray,
-        rotation: Int, mode: Int, k: Float, t: Float, dng: Boolean
+        dngImage: Image?, w: Int, h: Int, c: CameraCharacteristics, res: TotalCaptureResult, calibration: FloatArray,
+        rotation: Int, mode: Int, k: Float, t: Float
     ) {
         val t0 = SystemClock.elapsedRealtime()
         val name = "BITCAM_" + SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
         var message: String
         try {
             var dngNote = ""
-            if (dng) {
-                dngNote = try { saveDng(name, c, res, img, rotation); " + DNG" } catch (e: Exception) { " (DNG falhou)" }
+            if (dngImage != null) {
+                dngNote = try { saveDng(name, c, res, dngImage, rotation); " + DNG" } catch (e: Exception) { " (DNG falhou)" }
+                try { dngImage.close() } catch (_: Exception) { }
             }
-            val out = RawProcessor.develop(img, c, res, calibration, rotation, mode, k, t)
+            val out = RawProcessor.develop(w, h, c, res, calibration, rotation, mode, k, t)
             if (out == null) {
                 message = "Não foi possível revelar este RAW" + if (dngNote == " + DNG") " (o DNG foi salvo)." else "."
             } else {
-                val uri = saveJpeg(name, out.bitmap, res)
+                val uri = saveJpeg(name, out.bitmap, res, out.debug)
                 val small = Bitmap.createScaledBitmap(out.bitmap, 160, 160 * out.bitmap.height / out.bitmap.width, true)
                 out.bitmap.recycle()
                 val modeName = when (out.wbUsed) {
@@ -937,8 +999,9 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
                     else -> if (mode == RawProcessor.WB_AUTO) "Motorola (cena sem neutro)" else "Motorola"
                 }
                 val secs = (SystemClock.elapsedRealtime() - t0) / 1000f
-                message = String.format(Locale.US, "%s %d K, tint %+d · %s · %.1f s%s",
-                    modeName, (out.kelvin / 10).roundToInt() * 10, out.tint.roundToInt(), exposureText(res), secs, dngNote)
+                val burstText = if (out.frames > 1) String.format(Locale.US, "%d quadros (%.1f fundidos)", out.frames, out.meanFrames) else "1 quadro"
+                message = String.format(Locale.US, "%s %d K, tint %+d · %s · %s · %.1f s%s",
+                    modeName, (out.kelvin / 10).roundToInt() * 10, out.tint.roundToInt(), exposureText(res), burstText, secs, dngNote)
                 ui.post {
                     lastPhoto = uri
                     lastMime = "image/jpeg"
@@ -949,8 +1012,9 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
             }
         } catch (e: Throwable) {
             message = "Erro ao revelar: ${e.javaClass.simpleName} ${e.message ?: ""}"
+            try { Native.burstClear() } catch (_: Throwable) { }
         } finally {
-            try { img.close() } catch (_: Exception) { }
+            try { dngImage?.close() } catch (_: Exception) { }
         }
         finish(message)
     }
@@ -1001,7 +1065,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         }
     }
 
-    private fun saveJpeg(name: String, bmp: Bitmap, res: CaptureResult): Uri {
+    private fun saveJpeg(name: String, bmp: Bitmap, res: CaptureResult, debug: String): Uri {
         val uri = insert("$name.jpg", "image/jpeg")
         try {
             contentResolver.openOutputStream(uri)!!.use {
@@ -1012,7 +1076,9 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
                     val exif = ExifInterface(fd.fileDescriptor)
                     exif.setAttribute(ExifInterface.TAG_MAKE, android.os.Build.MANUFACTURER)
                     exif.setAttribute(ExifInterface.TAG_MODEL, android.os.Build.MODEL)
-                    exif.setAttribute(ExifInterface.TAG_SOFTWARE, "BITCAM")
+                    val version = try { packageManager.getPackageInfo(packageName, 0).versionName } catch (_: Exception) { null } ?: "?"
+                    exif.setAttribute(ExifInterface.TAG_SOFTWARE, "BITCAM $version")
+                    exif.setAttribute(ExifInterface.TAG_IMAGE_DESCRIPTION, debug)   // diagnóstico da revelação
                     exif.setAttribute(ExifInterface.TAG_DATETIME_ORIGINAL, SimpleDateFormat("yyyy:MM:dd HH:mm:ss", Locale.US).format(Date()))
                     res.get(CaptureResult.SENSOR_SENSITIVITY)?.let { exif.setAttribute(ExifInterface.TAG_ISO_SPEED_RATINGS, it.toString()) }
                     res.get(CaptureResult.SENSOR_EXPOSURE_TIME)?.let { exif.setAttribute(ExifInterface.TAG_EXPOSURE_TIME, (it / 1e9).toString()) }

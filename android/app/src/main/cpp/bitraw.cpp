@@ -288,10 +288,11 @@ bool neutralFor(const ColorCal& cal, float kelvin, float tint, float out[3]) {
 
 int toneForTest(float linear, float gain) { Tone t(gain, 0.20); return t(linear * gain); }
 
-bool develop(const uint16_t* raw, const RawParams& p, uint8_t* out, int outStride, RawInfo* info) {
+// Fonte: raw (uint16, com stride em bytes) ou rawF (float, width por linha: resultado da fusão).
+static bool developImpl(const uint16_t* raw, const float* rawF, const RawParams& p, uint8_t* out, int outStride, RawInfo* info) {
     const int W = p.cropW, H = p.cropH;
-    if (!raw || !out || W < 8 || H < 8 || p.cropX < 0 || p.cropY < 0 || p.cropX + W > p.width || p.cropY + H > p.height) return false;
-    if (p.cfa < 0 || p.cfa > 3 || p.stride < p.width * 2) return false;
+    if ((!raw && !rawF) || !out || W < 8 || H < 8 || p.cropX < 0 || p.cropY < 0 || p.cropX + W > p.width || p.cropY + H > p.height) return false;
+    if (p.cfa < 0 || p.cfa > 3 || (raw && p.stride < p.width * 2)) return false;
     if (p.rotation != 0 && p.rotation != 90 && p.rotation != 180 && p.rotation != 270) return false;
 
     // cor (0 R, 1 G, 2 B) e posição no bloco 2x2 de um pixel do recorte
@@ -309,7 +310,8 @@ bool develop(const uint16_t* raw, const RawParams& p, uint8_t* out, int outStrid
         std::vector<float> gr(shade ? p.shCols * 3 : 0);
         for (int y = y0; y < y1; y++) {
             const int ry = y + p.cropY;
-            const uint16_t* src = (const uint16_t*)((const uint8_t*)raw + (size_t)ry * p.stride) + p.cropX;
+            const uint16_t* src = raw ? (const uint16_t*)((const uint8_t*)raw + (size_t)ry * p.stride) + p.cropX : nullptr;
+            const float* srcF = raw ? nullptr : rawF + (size_t)ry * p.width + p.cropX;
             float* dst = &plane[(size_t)y * W];
             if (shade) {   // linha do mapa interpolada na vertical: [coluna][R,G,B]
                 float fy = (float)ry / (p.height - 1) * (p.shRows - 1);
@@ -326,7 +328,7 @@ bool develop(const uint16_t* raw, const RawParams& p, uint8_t* out, int outStrid
             const float sx = shade ? (float)(p.shCols - 1) / (p.width - 1) : 0;
             for (int x = 0; x < W; x++) {
                 int pos = ((ry & 1) << 1) | ((x + p.cropX) & 1);
-                float v = ((float)src[x] - p.black[pos]) * invRange[pos];
+                float v = ((src ? (float)src[x] : srcF[x]) - p.black[pos]) * invRange[pos];
                 if (v < 0) v = 0;
                 if (shade) {
                     float fx = (x + p.cropX) * sx;
@@ -593,6 +595,341 @@ bool develop(const uint16_t* raw, const RawParams& p, uint8_t* out, int outStrid
         info->confidence = (float)conf;
     }
     return true;
+}
+
+bool develop(const uint16_t* raw, const RawParams& p, uint8_t* out, int outStride, RawInfo* info) {
+    return developImpl(raw, nullptr, p, out, outStride, info);
+}
+
+// ================================================================ fusão de burst
+namespace {
+
+// Cinza de meia resolução: média de cada bloco Bayer 2x2. Deslocamentos inteiros aqui valem
+// 2 px no RAW, o que preserva a fase do mosaico.
+struct Gray {
+    int w = 0, h = 0;
+    std::vector<uint16_t> d;
+};
+
+Gray grayHalf(const uint16_t* raw, int width, int height, int stride) {
+    Gray g;
+    g.w = width / 2; g.h = height / 2;
+    g.d.resize((size_t)g.w * g.h);
+    parallelRows(g.h, [&](int y0, int y1) {
+        for (int y = y0; y < y1; y++) {
+            const uint16_t* a = (const uint16_t*)((const uint8_t*)raw + (size_t)(2 * y) * stride);
+            const uint16_t* b = (const uint16_t*)((const uint8_t*)raw + (size_t)(2 * y + 1) * stride);
+            uint16_t* o = &g.d[(size_t)y * g.w];
+            for (int x = 0; x < g.w; x++) o[x] = (uint16_t)((a[2 * x] + a[2 * x + 1] + b[2 * x] + b[2 * x + 1] + 2) >> 2);
+        }
+    });
+    return g;
+}
+
+Gray down4(const Gray& s) {
+    Gray g;
+    g.w = s.w / 4; g.h = s.h / 4;
+    g.d.resize((size_t)g.w * g.h);
+    for (int y = 0; y < g.h; y++) {
+        for (int x = 0; x < g.w; x++) {
+            uint32_t sum = 0;
+            for (int k = 0; k < 4; k++) {
+                const uint16_t* q = &s.d[(size_t)(y * 4 + k) * s.w + x * 4];
+                sum += q[0] + q[1] + q[2] + q[3];
+            }
+            g.d[(size_t)y * g.w + x] = (uint16_t)((sum + 8) >> 4);
+        }
+    }
+    return g;
+}
+
+inline uint32_t sadRow(const uint16_t* a, const uint16_t* b, int n) {
+    uint32_t s = 0;
+    for (int i = 0; i < n; i++) { int d = (int)a[i] - (int)b[i]; s += (uint32_t)(d < 0 ? -d : d); }
+    return s;
+}
+
+// Deslocamento global (dx,dy) tal que alt[y+dy][x+dx] ≈ ref[y][x], procurado em torno de (cx,cy).
+void searchGlobal(const Gray& ref, const Gray& alt, int cx, int cy, int r, int* bx, int* by) {
+    const int W = ref.w, H = ref.h;
+    const int m = std::max(std::abs(cx), std::abs(cy)) + r + 1;
+    *bx = cx; *by = cy;
+    if (W - 2 * m < 8 || H - 2 * m < 8) return;
+    double best = 1e300;
+    for (int dy = cy - r; dy <= cy + r; dy++) {
+        for (int dx = cx - r; dx <= cx + r; dx++) {
+            uint64_t s = 0;
+            for (int y = m; y < H - m; y++) s += sadRow(&ref.d[(size_t)y * W + m], &alt.d[(size_t)(y + dy) * W + m + dx], W - 2 * m);
+            double c = (double)s * (1 + 0.002 * (std::abs(dx - cx) + std::abs(dy - cy)));
+            if (c < best) { best = c; *bx = dx; *by = dy; }
+        }
+    }
+}
+
+struct Field {
+    int ts = 0, tw = 0, th = 0;       // tamanho do bloco e quantos blocos
+    std::vector<int16_t> dx, dy;
+};
+
+// Alinhamento por blocos: cada bloco procura o melhor deslocamento perto do palpite inicial.
+// Lida com rotação leve da mão e paralaxe, que um deslocamento global não corrige.
+template <class Init>
+Field alignTiles(const Gray& ref, const Gray& alt, int ts, int r, Init init) {
+    Field f;
+    f.ts = ts;
+    f.tw = (ref.w + ts - 1) / ts; f.th = (ref.h + ts - 1) / ts;
+    f.dx.assign((size_t)f.tw * f.th, 0); f.dy.assign((size_t)f.tw * f.th, 0);
+    const int W = ref.w, H = ref.h;
+    parallelRows(f.th, [&](int t0, int t1) {
+        for (int ty = t0; ty < t1; ty++) {
+            for (int tx = 0; tx < f.tw; tx++) {
+                int x0 = tx * ts, y0 = ty * ts;
+                int w = std::min(ts, W - x0), h = std::min(ts, H - y0);
+                int ix = 0, iy = 0;
+                init(tx, ty, &ix, &iy);
+                double best = 1e300;
+                int bx = ix, by = iy;
+                bool found = false;
+                for (int dy = iy - r; dy <= iy + r; dy++) {
+                    if (y0 + dy < 0 || y0 + h + dy > H) continue;
+                    for (int dx = ix - r; dx <= ix + r; dx++) {
+                        if (x0 + dx < 0 || x0 + w + dx > W) continue;
+                        uint32_t s = 0;
+                        for (int y = 0; y < h; y++) s += sadRow(&ref.d[(size_t)(y0 + y) * W + x0], &alt.d[(size_t)(y0 + y + dy) * W + x0 + dx], w);
+                        // em área lisa o ruído decide; o viés mantém o palpite inicial
+                        double c = (double)s * (1 + 0.01 * (std::abs(dx - ix) + std::abs(dy - iy))) + 1e-3 * (std::abs(dx - ix) + std::abs(dy - iy));
+                        if (c < best) { best = c; bx = dx; by = dy; found = true; }
+                    }
+                }
+                if (!found) { bx = 0; by = 0; }
+                f.dx[(size_t)ty * f.tw + tx] = (int16_t)bx;
+                f.dy[(size_t)ty * f.tw + tx] = (int16_t)by;
+            }
+        }
+    });
+    return f;
+}
+
+double sharpness(const Gray& g) {
+    double s = 0;
+    for (int y = 0; y < g.h - 1; y++) {
+        const uint16_t* a = &g.d[(size_t)y * g.w];
+        for (int x = 0; x < g.w - 1; x++) s += std::abs((int)a[x] - (int)a[x + 1]) + std::abs((int)a[x] - (int)a[x + g.w]);
+    }
+    return s;
+}
+
+// Diferença esperada entre dois quadros só por ruído, em função do tom, medida nos próprios dados
+// (mediana, que ignora o que se mexeu). absDiff = soma das diferenças absolutas das 4 amostras Bayer.
+std::vector<float> noiseCurve(const Gray& ref, const std::vector<uint16_t>& absDiff, float black, float white, float* mid) {
+    const int NB = 32, HB = 1024;
+    std::vector<uint32_t> hist((size_t)NB * HB, 0);
+    const float range = std::max(16.0f, white - black);
+    auto binOf = [&](float v) {
+        float l = (v - black) / range;
+        l = l < 0 ? 0 : l > 1 ? 1 : l;
+        return std::sqrt(l) * (NB - 1);
+    };
+    for (int y = 0; y < ref.h; y += 2) {
+        for (int x = 0; x < ref.w; x += 2) {
+            size_t i = (size_t)y * ref.w + x;
+            uint16_t a = absDiff[i];
+            if (a == 0xFFFF) continue;
+            int b = (int)(binOf(ref.d[i]) + 0.5f);
+            hist[(size_t)b * HB + std::min<int>(a, HB - 1)]++;
+        }
+    }
+    float sig[NB];
+    bool ok[NB];
+    bool any = false;
+    for (int b = 0; b < NB; b++) {
+        const uint32_t* hrow = &hist[(size_t)b * HB];
+        uint64_t total = 0;
+        for (int k = 0; k < HB; k++) total += hrow[k];
+        ok[b] = total >= 300;
+        sig[b] = 0;
+        if (!ok[b]) continue;
+        uint64_t half = total / 2, cum = 0;
+        for (int k = 0; k < HB; k++) {
+            if (cum + hrow[k] > half) {
+                double med = k - 0.5 + (double)(half - cum) / hrow[k];
+                sig[b] = (float)std::max(2.0, med);
+                break;
+            }
+            cum += hrow[k];
+        }
+        any = true;
+    }
+    for (int b = 0; b < NB; b++) {   // preenche tons sem amostras com o vizinho válido mais próximo
+        if (ok[b] || !any) continue;
+        for (int d = 1; d < NB; d++) {
+            if (b - d >= 0 && ok[b - d]) { sig[b] = sig[b - d]; break; }
+            if (b + d < NB && ok[b + d]) { sig[b] = sig[b + d]; break; }
+        }
+    }
+    if (!any) for (int b = 0; b < NB; b++) sig[b] = 16;
+    for (int b = 1; b < NB; b++) sig[b] = std::max(sig[b], sig[b - 1] * 0.85f);   // ruído não cai muito com a luz
+    int top = (int)std::min(65535.0f, std::max(white, 255.0f));
+    std::vector<float> lut((size_t)top + 1);
+    for (int v = 0; v <= top; v++) {
+        float fb = binOf((float)v);
+        int b0 = std::min(NB - 2, (int)fb);
+        float t = fb - b0;
+        lut[v] = sig[b0] * (1 - t) + sig[b0 + 1] * t;
+    }
+    // soma de 4 |diferenças| -> desvio-padrão de uma amostra de um quadro: /4, /0,8 (média do módulo), /raiz de 2
+    if (mid) *mid = sig[(int)(std::sqrt(0.18f) * (NB - 1))] / (4 * 0.798f * 1.414f);
+    return lut;
+}
+
+bool mergeBurst(const uint16_t* const* frames, int n, const RawParams& p, std::vector<float>& out, BurstInfo* info) {
+    const int W = p.width, H = p.height;
+    const int ew = W & ~1, eh = H & ~1;   // área coberta por blocos 2x2 inteiros
+
+    // referência = o mais nítido dos três primeiros (o toque no botão costuma tremer o primeiro)
+    int refIdx = 0;
+    {
+        double best = -1;
+        for (int i = 0; i < std::min(3, n); i++) {
+            double s = sharpness(down4(grayHalf(frames[i], W, H, p.stride)));
+            if (s > best) { best = s; refIdx = i; }
+        }
+    }
+    const uint16_t* refRaw = frames[refIdx];
+    Gray r0 = grayHalf(refRaw, W, H, p.stride), r1 = down4(r0), r2 = down4(r1);
+    const int GW = r0.w, GH = r0.h;
+
+    out.resize((size_t)W * H);
+    parallelRows(H, [&](int y0, int y1) {
+        for (int y = y0; y < y1; y++) {
+            const uint16_t* s = (const uint16_t*)((const uint8_t*)refRaw + (size_t)y * p.stride);
+            float* d = &out[(size_t)y * W];
+            for (int x = 0; x < W; x++) d[x] = s[x];
+        }
+    });
+    std::vector<float> wsum((size_t)GW * GH, 1.0f);
+    std::vector<uint16_t> ad((size_t)GW * GH);
+    std::vector<float> sigma;
+    float black = (p.black[0] + p.black[1] + p.black[2] + p.black[3]) * 0.25f, midNoise = 0;
+
+    for (int i = 0; i < n; i++) {
+        if (i == refIdx) continue;
+        const uint16_t* altRaw = frames[i];
+        Gray a0 = grayHalf(altRaw, W, H, p.stride), a1 = down4(a0), a2 = down4(a1);
+
+        int gx = 0, gy = 0;
+        searchGlobal(r2, a2, 0, 0, 6, &gx, &gy);
+        searchGlobal(r1, a1, gx * 4, gy * 4, 3, &gx, &gy);
+        Field f1 = alignTiles(r1, a1, 16, 3, [&](int, int, int* ix, int* iy) { *ix = gx; *iy = gy; });
+        Field f0 = alignTiles(r0, a0, 32, 3, [&](int tx, int ty, int* ix, int* iy) {
+            int px = std::min(f1.tw - 1, tx / 2), py = std::min(f1.th - 1, ty / 2);
+            *ix = f1.dx[(size_t)py * f1.tw + px] * 4;
+            *iy = f1.dy[(size_t)py * f1.tw + px] * 4;
+        });
+
+        // diferença contra a referência, já com o deslocamento de cada bloco: soma dos módulos das
+        // 4 amostras Bayer. Comparar cada cor (e não o cinza) pega objetos que mudam de cor sem mudar de brilho.
+        parallelRows(f0.th, [&](int t0, int t1) {
+            for (int ty = t0; ty < t1; ty++) {
+                for (int tx = 0; tx < f0.tw; tx++) {
+                    int dx = f0.dx[(size_t)ty * f0.tw + tx], dy = f0.dy[(size_t)ty * f0.tw + tx];
+                    int x1 = std::min(GW, (tx + 1) * 32), yEnd = std::min(GH, (ty + 1) * 32);
+                    for (int y = ty * 32; y < yEnd; y++) {
+                        int ay = y + dy;
+                        const uint16_t* rr0 = (const uint16_t*)((const uint8_t*)refRaw + (size_t)(2 * y) * p.stride);
+                        const uint16_t* rr1 = (const uint16_t*)((const uint8_t*)refRaw + (size_t)(2 * y + 1) * p.stride);
+                        const bool rowOk = ay >= 0 && ay < GH;
+                        const uint16_t* aa0 = rowOk ? (const uint16_t*)((const uint8_t*)altRaw + (size_t)(2 * ay) * p.stride) : nullptr;
+                        const uint16_t* aa1 = rowOk ? (const uint16_t*)((const uint8_t*)altRaw + (size_t)(2 * ay + 1) * p.stride) : nullptr;
+                        for (int x = tx * 32; x < x1; x++) {
+                            int ax = x + dx;
+                            size_t k = (size_t)y * GW + x;
+                            if (!rowOk || ax < 0 || ax >= GW) { ad[k] = 0xFFFF; continue; }
+                            int d0 = (int)rr0[2 * x] - (int)aa0[2 * ax], d1 = (int)rr0[2 * x + 1] - (int)aa0[2 * ax + 1];
+                            int d2 = (int)rr1[2 * x] - (int)aa1[2 * ax], d3 = (int)rr1[2 * x + 1] - (int)aa1[2 * ax + 1];
+                            int d = std::abs(d0) + std::abs(d1) + std::abs(d2) + std::abs(d3);
+                            ad[k] = (uint16_t)std::min(0xFFFE, d);
+                        }
+                    }
+                }
+            }
+        });
+        if (sigma.empty()) sigma = noiseCurve(r0, ad, black, p.white, &midNoise);
+        const int top = (int)sigma.size() - 1;
+
+        // peso por pixel: a diferença média 3x3 (36 amostras) comparada à esperada só por ruído.
+        // Ruído puro dá ~1,0 (com desvio ~0,13); acima de 1,45 começa a desconfiar; em 2,1 o quadro é ignorado ali.
+        parallelRows(f0.th, [&](int t0, int t1) {
+            for (int ty = t0; ty < t1; ty++) {
+                for (int tx = 0; tx < f0.tw; tx++) {
+                    int dx = f0.dx[(size_t)ty * f0.tw + tx] * 2, dy = f0.dy[(size_t)ty * f0.tw + tx] * 2;
+                    int x1 = std::min(GW, (tx + 1) * 32), yEnd = std::min(GH, (ty + 1) * 32);
+                    for (int y = ty * 32; y < yEnd; y++) {
+                        int ya = y > 0 ? y - 1 : y, yb = y < GH - 1 ? y + 1 : y;
+                        for (int x = tx * 32; x < x1; x++) {
+                            int xa = x > 0 ? x - 1 : x, xb = x < GW - 1 ? x + 1 : x;
+                            uint32_t e = (uint32_t)ad[(size_t)ya * GW + xa] + ad[(size_t)ya * GW + x] + ad[(size_t)ya * GW + xb] +
+                                         ad[(size_t)y * GW + xa] + ad[(size_t)y * GW + x] + ad[(size_t)y * GW + xb] +
+                                         ad[(size_t)yb * GW + xa] + ad[(size_t)yb * GW + x] + ad[(size_t)yb * GW + xb];
+                            if (e >= 0xFFFF) continue;   // algum vizinho fora do quadro
+                            float sg = sigma[std::min<int>(top, r0.d[(size_t)y * GW + x])];
+                            float w = (2.1f - (e * (1.0f / 9)) / sg) * (1.0f / 0.65f);
+                            if (w <= 0) continue;
+                            if (w > 1) w = 1;
+                            wsum[(size_t)y * GW + x] += w;
+                            for (int j = 0; j < 2; j++) {
+                                const uint16_t* s = (const uint16_t*)((const uint8_t*)altRaw + (size_t)(2 * y + j + dy) * p.stride) + 2 * x + dx;
+                                float* d = &out[(size_t)(2 * y + j) * W + 2 * x];
+                                d[0] += w * s[0];
+                                d[1] += w * s[1];
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    double total = 0;
+    for (int y = 0; y < GH; y++) {
+        double rowSum = 0;
+        for (int x = 0; x < GW; x++) rowSum += wsum[(size_t)y * GW + x];
+        total += rowSum;
+    }
+    parallelRows(eh, [&](int y0, int y1) {
+        for (int y = y0; y < y1; y++) {
+            float* d = &out[(size_t)y * W];
+            const float* ws = &wsum[(size_t)(y >> 1) * GW];
+            for (int x = 0; x < ew; x++) d[x] /= ws[x >> 1];
+        }
+    });
+    if (info) {
+        info->frames = n;
+        info->refIndex = refIdx;
+        info->meanWeight = (float)(total / ((double)GW * GH));
+        info->noise = midNoise;
+    }
+    return true;
+}
+
+} // namespace
+
+bool developBurst(const uint16_t* const* frames, int n, const RawParams& p, uint8_t* out, int outStride,
+                  RawInfo* info, BurstInfo* burst) {
+    if (!frames || n < 1 || !frames[0]) return false;
+    if (burst) { burst->frames = n; burst->refIndex = 0; burst->meanWeight = 1; burst->noise = 0; }
+    if (n == 1 || p.width < 64 || p.height < 64) return developImpl(frames[0], nullptr, p, out, outStride, info);
+    if (p.stride < p.width * 2 || p.cropX < 0 || p.cropY < 0 || p.cropX + p.cropW > p.width || p.cropY + p.cropH > p.height) return false;
+    for (int i = 0; i < n; i++) if (!frames[i]) return false;
+
+    std::vector<float> merged;
+    BurstInfo bi;
+    if (!mergeBurst(frames, n, p, merged, &bi)) return false;
+    if (burst) *burst = bi;
+    // menos ruído depois da fusão: o acabamento (redução de ruído, nitidez) trabalha como em ISO mais baixo
+    RawParams q = p;
+    q.iso = std::max(50, (int)(p.iso / std::max(1.0f, bi.meanWeight)));
+    return developImpl(nullptr, merged.data(), q, out, outStride, info);
 }
 
 } // namespace bitraw
